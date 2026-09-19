@@ -13,13 +13,14 @@
 #
 #   ./argo-wf.sh                 first run asks for server + namespaces
 #   ./argo-wf.sh --setup         change the settings
+#   ./argo-wf.sh --update        replace this file with the latest release
 #   ./argo-wf.sh --help
 #
 # SPDX-License-Identifier: MIT
 # ═══════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ─── Colors & helpers ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -424,7 +425,7 @@ config_apply() {
   NAMESPACES=(${ARGO_WF_NAMESPACES//,/ })
   CURL_OPTS=()
   [[ "${ARGO_WF_INSECURE:-}" == "1" ]] && CURL_OPTS=(-k)
-  CACHE_KEY=$(printf '%s' "${ARGO_WF_SERVER}|${NAMESPACES[*]:-}|${ARGOCD_SERVER}|${ARGOCD_SELECTOR}" | cksum | awk '{print $1}')
+  CACHE_KEY=$(printf '%s' "${VERSION}|${ARGO_WF_SERVER}|${NAMESPACES[*]:-}|${ARGOCD_SERVER}|${ARGOCD_SELECTOR}" | cksum | awk '{print $1}')
 }
 
 # First run / --setup: three short prompts, all optional to change.
@@ -916,7 +917,7 @@ _argo_flush_diff() {
 # line "META <version> <running> <waiting> <config key>", then the list.
 # rc 3 = 401 (a new token is needed). Bump ARGO_WF_CACHE_VER whenever the row
 # or URL format changes — an older cache is then ignored at start-up.
-ARGO_WF_CACHE_VER=4
+ARGO_WF_CACHE_VER=5
 _argo_wf_build() {
   local outfile="$1"
   local ns rows phase name age dur prog url total_running=0 total_waiting=0
@@ -1100,6 +1101,8 @@ _argo_wf_build() {
     line="${line/${color}${icon}${NC} ${phase}/${color}${icon} ${phase}${NC}}"
     list+="${url}"$'\t'"$(printf '%b' "$line")"$'\n'
   done <<< "$recs"
+  list+="$rule"
+  list+="__UPDATE__"$'\t'"$(printf '%b' "${DIM}⬆ Update argo-wf (this is ${VERSION})${NC}")"$'\n'
 
   printf 'META %s %s %s %s\n%s' "$ARGO_WF_CACHE_VER" "$total_running" "$total_waiting" "$CACHE_KEY" "${list%$'\n'}" > "$outfile"
   # cache for an instant start next time (shown at once, refreshed behind it)
@@ -1269,6 +1272,7 @@ NAV
     cursor="$sel"
     if [[ "$url" == "__RULE__" || "$url" == "__SKIP__" ]]; then reuse=1; continue; fi
     if [[ "$url" == "__ARGOCD_LOGIN__" ]]; then argocd_login; continue; fi
+    if [[ "$url" == "__UPDATE__" ]]; then self_update ui; reuse=1; continue; fi
     if [[ "$url" == __WAIT__* ]]; then
       # shellcheck disable=SC2086
       set -- $url; argo_wf_approve "$2" "$3" "$4" "$5" "${*:6}"; continue
@@ -1276,6 +1280,122 @@ NAV
     if [[ -z "$url" ]]; then cursor=0; continue; fi   # Refresh → a new table
     _open_url "$url"; reuse=1
   done
+}
+
+# ─── Self-update ─────────────────────────────────────────────────────
+# Only ever on request (the ⬆ row or --update), never in the background: this
+# tool holds a token that can approve deployments, so its code changes when
+# you say so. The new file is downloaded next to the script, checked (shebang,
+# VERSION line, `bash -n`), shown as "old → new" for confirmation and moved
+# into place with an atomic rename — the running bash keeps reading the old
+# inode, so overwriting itself is safe — then the tool restarts into it.
+UPDATE_URL="${ARGO_WF_UPDATE_URL:-https://raw.githubusercontent.com/lukas-pastva/cli-argo-wf/main/argo-wf.sh}"
+
+# Absolute path of this script with symlinks resolved (a symlink on PATH must
+# not be replaced by a regular file).
+_self_path() {
+  local p="${BASH_SOURCE[0]}" l
+  while [[ -L "$p" ]]; do
+    l=$(readlink "$p"); [[ "$l" == /* ]] || l="$(dirname "$p")/$l"; p="$l"
+  done
+  printf '%s/%s' "$(cd "$(dirname "$p")" && pwd -P)" "$(basename "$p")"
+}
+
+# _ver_gt A B — 0 when dotted version A is newer than B.
+_ver_gt() {
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+)*$ && "$2" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+  local IFS=. i
+  # shellcheck disable=SC2206
+  local a=($1) b=($2)
+  for i in 0 1 2 3; do
+    (( 10#${a[i]:-0} > 10#${b[i]:-0} )) && return 0
+    (( 10#${a[i]:-0} < 10#${b[i]:-0} )) && return 1
+  done
+  return 1
+}
+
+# self_update ui|cli — "ui" draws inside the frame and restarts the panel,
+# "cli" prints plain lines (./argo-wf.sh --update). rc 0 = updated or current.
+UPDATE_MODE="cli"
+_up_say() {   # <kind: info|ok|warn|err> <text>
+  local icon
+  case "$1" in ok) icon="${GREEN}✔${NC}" ;; warn) icon="${YELLOW}⚠${NC}" ;; err) icon="${RED}✖${NC}" ;; *) icon="${CYAN}▸${NC}" ;; esac
+  if [[ "$UPDATE_MODE" == "ui" ]]; then sline "$icon" "$2"; else printf "  %b %s\n" "$icon" "$2"; fi
+}
+_up_end() { [[ "$UPDATE_MODE" == "ui" ]] && pause_close; return "${1:-0}"; }
+
+self_update() {
+  UPDATE_MODE="${1:-cli}"
+  local self dir new newver answer
+  self=$(_self_path); dir=$(dirname "$self")
+  new="${self}.new.$$"
+  [[ "$UPDATE_MODE" == "ui" ]] && section "Argo WF — update"
+  if [[ ! -f "$self" ]]; then
+    _up_say err "Cannot tell which file this script runs from — download it again instead:"
+    _up_say info "curl -fsSLo argo-wf.sh ${UPDATE_URL}"
+    _up_end 1; return
+  fi
+  if command -v git >/dev/null && git -C "$dir" ls-files --error-unmatch "$(basename "$self")" >/dev/null 2>&1; then
+    _up_say warn "${self/#$HOME/~} is tracked by git — update it with: git -C ${dir/#$HOME/~} pull"
+    _up_end 1; return
+  fi
+  if [[ ! -w "$self" || ! -w "$dir" ]]; then
+    _up_say err "No write access to ${self/#$HOME/~} — update it with:"
+    _up_say info "sudo curl -fsSLo ${self} ${UPDATE_URL}"
+    _up_end 1; return
+  fi
+  _up_say info "Checking ${UPDATE_URL#https://} …"
+  if ! curl -fsSL --max-time 30 -o "$new" "$UPDATE_URL" 2>/dev/null; then
+    rm -f "$new"
+    _up_say err "Download failed — no network, or the address is wrong."
+    _up_end 1; return
+  fi
+  newver=$(sed -n 's/^VERSION="\([0-9][0-9.]*\)"$/\1/p' "$new" | head -1)
+  if [[ "$(head -1 "$new")" != "#!/usr/bin/env bash" || -z "$newver" ]] || ! bash -n "$new" 2>/dev/null; then
+    rm -f "$new"
+    _up_say err "What came back is not a valid argo-wf.sh — nothing was changed."
+    _up_end 1; return
+  fi
+  if cmp -s "$self" "$new"; then
+    rm -f "$new"
+    _up_say ok "Already up to date (${VERSION})."
+    _up_end 0; return
+  fi
+  if _ver_gt "$VERSION" "$newver"; then
+    rm -f "$new"
+    _up_say warn "The published version (${newver}) is older than this one (${VERSION}) — nothing was changed."
+    _up_end 0; return
+  fi
+  local what="${VERSION} → ${newver}"
+  [[ "$VERSION" == "$newver" ]] && what="${VERSION} → ${newver} (same number, different content)"
+  if [[ "$UPDATE_MODE" == "ui" ]]; then
+    UI_TITLE="Argo WF — update"
+    ui_select "✖  No, keep ${VERSION}
+✔  Yes, update ${what}" "update" \
+      "New version available: ${what} · Enter = select · Esc = back" \
+      || { rm -f "$new"; return 0; }
+    [[ "$UI_RESULT" == "✔"* ]] || { rm -f "$new"; return 0; }
+  else
+    _up_say info "New version available: ${what}"
+    read -rp "    Replace ${self/#$HOME/~}? [y/N] " answer </dev/tty
+    [[ "$answer" == "y" || "$answer" == "Y" ]] || { rm -f "$new"; _up_say warn "Cancelled."; return 0; }
+  fi
+  [[ -x "$self" ]] && chmod +x "$new"
+  if ! mv -f "$new" "$self"; then
+    rm -f "$new"
+    [[ "$UPDATE_MODE" == "ui" ]] && section "Argo WF — update"
+    _up_say err "Could not replace ${self/#$HOME/~}."
+    _up_end 1; return
+  fi
+  if [[ "$UPDATE_MODE" == "ui" ]]; then
+    section "Argo WF — update"
+    sline "${GREEN}✔${NC}" "Updated ${what} — restarting …"
+    section_close
+    sleep 1
+    cleanup
+    exec "$self" --config "$CONFIG_FILE"
+  fi
+  _up_say ok "Updated ${what}."
 }
 
 # ─── Command line ────────────────────────────────────────────────────
@@ -1291,6 +1411,7 @@ Usage: ${0##*/} [options]
   -c, --config FILE        config file (default: ${CONFIG_FILE/#$HOME/~})
       --setup              ask for server / namespaces / Argo CD again
       --logout             forget the saved token
+      --update             replace this file with the latest published version
   -h, --help               this help
   -V, --version            print the version
 
@@ -1324,7 +1445,7 @@ check_deps() {
 }
 
 main() {
-  local opt_server="" opt_ns="" opt_argocd="" has_argocd=0 do_setup=0 do_logout=0
+  local opt_server="" opt_ns="" opt_argocd="" has_argocd=0 do_setup=0 do_logout=0 do_update=0
   while (( $# )); do
     case "$1" in
       -s|--server)     opt_server="${2:-}"; shift 2 || { usage; exit 2; } ;;
@@ -1333,11 +1454,15 @@ main() {
       -c|--config)     CONFIG_FILE="${2:-}"; shift 2 || { usage; exit 2; } ;;
       --setup)         do_setup=1; shift ;;
       --logout)        do_logout=1; shift ;;
+      --update)        do_update=1; shift ;;
       -h|--help)       usage; exit 0 ;;
       -V|--version)    echo "argo-wf ${VERSION}"; exit 0 ;;
       *)               err "Unknown option: $1"; usage; exit 2 ;;
     esac
   done
+  if (( do_update )); then
+    self_update cli; exit $?
+  fi
   if (( do_logout )); then
     config_unset ARGO_TOKEN
     ok "Token removed from ${CONFIG_FILE/#$HOME/~}"

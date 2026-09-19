@@ -48,7 +48,13 @@ chmod +x argo-wf.sh
 ./argo-wf.sh
 ```
 
-Put it anywhere on your `PATH` if you like. It is a single file; to update, download it again.
+Put it anywhere on your `PATH` if you like.
+
+### Updating
+
+Press Enter on the **⬆ Update argo-wf** row at the bottom of the table, or run `./argo-wf.sh --update`. The tool downloads the current `argo-wf.sh` from this repository, checks that it really is the script (shebang, version line, `bash -n`), shows `old → new` and — after you confirm — swaps the file with an atomic rename and restarts into it. Your settings and token live in the config file, so they are untouched.
+
+It never checks or updates by itself: this tool holds a token that can approve deployments, so its code changes only when you say so. A copy inside a git checkout is left to `git pull`; without write access you get the `curl` command to run instead. `ARGO_WF_UPDATE_URL` points the update at a fork or an internal mirror.
 
 ## First run
 
@@ -84,6 +90,7 @@ SSO sessions expire (10 hours by default). When the server starts answering `401
 | `Enter` on a **Waiting** workflow | approve it / open it |
 | `Enter` on an Argo CD row | open the application — or that resource's diff — in the Argo CD UI |
 | `Enter` on `↻ Refresh` | reload now |
+| `Enter` on `⬆ Update argo-wf` | check for a newer version and install it |
 | `Esc` | back / quit |
 
 The table refreshes by itself (countdown in the top-right corner). The refresh is built in the background and swapped in without moving your cursor, and it waits while you are typing a filter or moving around. The last table is cached, so the next start shows something immediately and refreshes behind it.
@@ -137,6 +144,7 @@ Everything lives in `~/.config/argo-wf/config` (mode `600`, plain `KEY="value"` 
 - The token is stored in the config file with mode `600` and is never printed in full.
 - Tokens are handed to `curl` on stdin, not on the command line, so they do not show up in `ps`.
 - The tool only reads, except for the explicit, confirmed *resume* request described above.
+- No background update checks, no telemetry; the only hosts contacted are your Argo servers — and GitHub when you ask for an update.
 
 ## License
 
