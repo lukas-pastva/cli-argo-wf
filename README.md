@@ -110,11 +110,11 @@ so the server records you as the one who resumed it, and your usual RBAC applies
 
 ## What is out of sync (Argo CD)
 
-For every waiting workflow the tool looks up the Argo CD applications that belong to it and lists the resources that actually differ, with a compact `key: old → new` diff (changed part highlighted).
+For every waiting workflow the tool looks up the Argo CD applications that belong to it and lists the resources that actually differ, with a compact `key: old → new` diff (changed part highlighted). Multi-line values — a ConfigMap's `config.yaml`, say — are compared line by line under a `data.config.yaml:` heading, so you see the lines that changed, not the whole file.
 
 - Applications are found by **label selector** `ARGOCD_SELECTOR`, default `app={namespace},batch={batch}` — `{namespace}` is the workflow's namespace, `{batch}` the batch it waits on (terms with `{batch}` are dropped when there is none). Adjust it to however your applications are labelled.
 - Keys in `ARGOCD_DIFF_IGNORE` (default `labels`) are removed from both sides before comparing — a chart version bump that only touches labels is noise. Applications that differ *only* there are treated as synced.
-- Diffs longer than `ARGOCD_DIFF_LINES` (default 5) collapse into `… N changes`; press Enter on the resource to see the full diff in the Argo CD UI.
+- Diffs longer than `ARGOCD_DIFF_LINES` (default 5, headings not counted) collapse into `… N changes`; press Enter on the resource to see the full diff in the Argo CD UI.
 - Authentication is the `argocd` CLI's own: if you are not signed in, a row offers `argocd login <server> --sso`.
 
 ## Configuration
