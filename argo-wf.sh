@@ -20,7 +20,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # ─── Colors & helpers ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -708,11 +708,14 @@ _argocd_token() {
 # via the API's /managed-resources (normalizedLiveState = live,
 # predictedLiveState = target; both JSON). Keys listed in ARGOCD_DIFF_IGNORE
 # are removed from both sides anywhere in the tree (default: labels — a chart
-# version bump in labels is only noise), then the pretty-printed JSON is
-# diffed line by line; hunks "NcM" with the same key become "key: old → new".
+# version bump in labels is only noise), multi-line strings (a ConfigMap's
+# config.yaml) are split into one JSON array element per line, then the
+# pretty-printed JSON is diffed line by line; hunks "NcM" with the same key
+# become "key: old → new". Lines whose enclosing key changed are preceded by
+# a "key" row with the path ("data.config.yaml:").
 # Resources differing only in ignored keys are counted, not listed.
 # Output rows (separator \x1f) in ARGOCD_DIFF:
-#   "res<S>Kind/name<S>ns<S>group", "chg<S>Kind/name<S>ns<S>group<S>chg|add|del<S>text"
+#   "res<S>Kind/name<S>ns<S>group", "chg<S>Kind/name<S>ns<S>group<S>chg|add|del|key<S>text"
 # rc 2 = 401 (not signed in), rc 1 = other error (ARGOCD_ERR).
 ARGOCD_DIFF=""
 ARGOCD_DIFF_LABELONLY=0
@@ -729,6 +732,10 @@ _argocd_app_diff() {
   if [[ "$code" != "200" ]]; then ARGOCD_ERR="managed-resources HTTP ${code}"; rm -f "$tmp.json"; return 1; fi
   for k in $ARGOCD_DIFF_IGNORE; do ign+="${ign:+, }.[\"${k}\"]"; done
   local strip="walk(if type == \"object\" then del(${ign:-.__none__}) else . end)"
+  # multi-line strings → arrays of lines: diff then works per line and the
+  # value never carries a "\n" escape into the table (printf %b would expand
+  # it into extra rows)
+  local expand='walk(if type == "string" and contains("\n") then split("\n") else . end)'
   # one line per resource: kind ns name group differs_without_ignored(0/1)
   # differs_at_all(0/1) live_b64 target_b64 (JSON through base64 — @tsv
   # would escape the backslashes inside JSON strings)
@@ -737,20 +744,46 @@ _argocd_app_diff() {
     [[ -n "$kind" ]] || continue
     if (( real == 0 )); then (( any == 1 )) && lo=$((lo + 1)); continue; fi
     ARGOCD_DIFF+="res${S}${kind}/${name}${S}${ns}${S}${group}"$'\n'
-    base64 --decode <<< "$live"   | jq -S "$strip" > "$tmp.live" 2>/dev/null
-    base64 --decode <<< "$target" | jq -S "$strip" > "$tmp.target" 2>/dev/null
+    # trailing commas dropped: otherwise appending an element marks the
+    # previous last one ("x" → "x",) as changed too
+    base64 --decode <<< "$live"   | jq -S "$strip | $expand" 2>/dev/null | sed 's/,$//' > "$tmp.live"
+    base64 --decode <<< "$target" | jq -S "$strip | $expand" 2>/dev/null | sed 's/,$//' > "$tmp.target"
     # HO/HN/HE = markers start-old / start-new / end of the changed part
     # (colors are added when the table is drawn; not \x01 — bash's CTLESC)
-    ARGOCD_DIFF+=$(diff "$tmp.live" "$tmp.target" | LC_ALL=C awk -v S="$S" -v HO=$'\x1c' -v HN=$'\x1d' -v HE=$'\x1e' -v res="${kind}/${name}" -v ns="$ns" -v grp="$group" '
+    ARGOCD_DIFF+=$(diff "$tmp.live" "$tmp.target" | LC_ALL=C awk -v S="$S" -v HO=$'\x1c' -v HN=$'\x1d' -v HE=$'\x1e' -v res="${kind}/${name}" -v ns="$ns" -v grp="$group" -v lf="$tmp.live" -v tf="$tmp.target" '
       function clean(s,   k, v) {
         sub(/^[ \t]+/, "", s); sub(/,$/, "", s)
         if (s ~ /^"[^"]+": /) { k = substr(s, 2, index(s, "\": ") - 2); v = substr(s, index(s, "\": ") + 3) }
         else { k = ""; v = s }
-        if (v ~ /^".*"$/) v = substr(v, 2, length(v) - 2)
+        if (v ~ /^".*"$/) { v = substr(v, 2, length(v) - 2); gsub(/\\"/, "\"", v) }
         return (k == "") ? v : k ": " v
       }
       function key(s) { return (s ~ /: /) ? substr(s, 1, index(s, ": ") - 1) : "" }
       function noise(s) { return s ~ /^[][{}]*$/ }
+      # ctx(file, arr) — arr[n] = path of the keys enclosing line n of the
+      # pretty-printed JSON ("data.config.yaml"), so a changed line inside an
+      # array (one line of a multi-line string) can be labelled with its key
+      function ctx(file, arr,   line, n, d, k, i, p, st) {
+        n = 0; d = 0
+        while ((getline line < file) > 0) {
+          n++
+          if (line ~ /^[ \t]*[\]}],?$/) { if (d > 0) d-- }
+          else if (line ~ /^[ \t]*("[^"]*": )?[\[{]$/) {
+            d++; k = ""
+            if (line ~ /": [\[{]$/) { k = line; sub(/^[ \t]*"/, "", k); sub(/": [\[{]$/, "", k) }
+            st[d] = k
+          }
+          p = ""; for (i = 1; i <= d; i++) if (st[i] != "") p = p (p == "" ? "" : ".") st[i]
+          arr[n] = p
+        }
+        close(file)
+      }
+      # out(type, text, path) — one row; a "key" row with the path first
+      # whenever the enclosing key changes
+      function out(t, text, c) {
+        if (c != lastc) { if (c != "") print "chg" S res S ns S grp S "key" S c ":"; lastc = c }
+        print "chg" S res S ns S grp S t S text
+      }
       # hl(a, b) — marks in a/b exactly the part that differs (common prefix
       # and suffix stay unmarked), result in HA/HB. Boundaries move out to the
       # word edge (1.2.13 → 1.2.14 highlights "13"/"14", not just "3"/"4");
@@ -772,21 +805,28 @@ _argocd_app_diff() {
             ko = key(old[i]); kn = key(new[i])
             if (ko != "" && ko == kn) {
               hl(substr(old[i], length(ko) + 3), substr(new[i], length(kn) + 3))
-              print "chg" S res S ns S grp S "chg" S ko ": " HA " → " HB
+              out("chg", ko ": " HA " → " HB, oc[i])
             } else {
               hl(old[i], new[i])
-              print "chg" S res S ns S grp S "del" S HA; print "chg" S res S ns S grp S "add" S HB
+              out("del", HA, oc[i]); out("add", HB, nc[i])
             }
           }
         } else {
-          for (i = 1; i <= no; i++) print "chg" S res S ns S grp S "del" S old[i]
-          for (i = 1; i <= nn; i++) print "chg" S res S ns S grp S "add" S new[i]
+          for (i = 1; i <= no; i++) out("del", old[i], oc[i])
+          for (i = 1; i <= nn; i++) out("add", new[i], nc[i])
         }
         no = 0; nn = 0; type = ""
       }
-      /^[0-9,]+[acd][0-9,]+$/ { flush(); type = $0; gsub(/[0-9,]/, "", type); next }
-      /^< / { s = clean(substr($0, 3)); if (!noise(s)) old[++no] = s; next }
-      /^> / { s = clean(substr($0, 3)); if (!noise(s)) new[++nn] = s; next }
+      BEGIN { ctx(lf, ctxL); ctx(tf, ctxT) }
+      # hunk header "12,15c12,16": lo/hi = first line of the hunk in live/target
+      /^[0-9,]+[acd][0-9,]+$/ {
+        flush(); match($0, /[acd]/); type = substr($0, RSTART, 1)
+        lo = substr($0, 1, RSTART - 1); sub(/,.*/, "", lo); lo += 0
+        hi = substr($0, RSTART + 1);    sub(/,.*/, "", hi); hi += 0
+        next
+      }
+      /^< / { s = clean(substr($0, 3)); c = ctxL[lo]; lo++; if (!noise(s)) { old[++no] = s; oc[no] = c }; next }
+      /^> / { s = clean(substr($0, 3)); c = ctxT[hi]; hi++; if (!noise(s)) { new[++nn] = s; nc[nn] = c }; next }
       END { flush() }
     ')$'\n'
   done < <(jq -r '
@@ -1000,7 +1040,7 @@ _argo_wf_build() {
               cd_real=$((cd_real + 1))
               _argo_prog "${RED}↳${NC}" "${cda}: ${nreal} changed"
               recs+="cdapp${S}${S}OutOfSync${S}${cda}${S}${S}${S}${S}${nreal} changed${S}${cdc}"$'\n'
-              # res<S>Kind/name<S>ns<S>group  |  chg<S>Kind/name<S>ns<S>group<S>add|del|chg<S>text
+              # res<S>Kind/name<S>ns<S>group  |  chg<S>Kind/name<S>ns<S>group<S>add|del|chg|key<S>text
               # Diff rows cannot be selected (key __SKIP__, the arrows skip them).
               local dbuf="" dcount=0
               while IFS="$S" read -r dres dname dns dgroup dtype dtext; do
@@ -1014,7 +1054,7 @@ _argo_wf_build() {
                   recs+="cdres${S}${S}${S}${dname}${S}${S}${S}${S}${dns}${S}${dkey}"$'\n'
                   continue
                 fi
-                dcount=$((dcount + 1))
+                [[ "$dtype" == "key" ]] || dcount=$((dcount + 1))
                 dbuf+="cdchg${S}${S}${dtype}${S}${S}${S}${S}${S}${dtext}${S}__SKIP__"$'\n'
               done <<< "$ARGOCD_DIFF"
               _argo_flush_diff ;;
@@ -1070,7 +1110,7 @@ _argo_wf_build() {
       cdok)    icon="↳"; color="$GREEN";  note="${DIM}${note}${NC}" ;;
       cdlogin) icon="↳"; color="$YELLOW"; note="${YELLOW}${note}${NC}" ;;
       cderr)   icon="↳"; color="$RED";    note="${RED}${note}${NC}" ;;
-      cdchg)   ;;   # phase = add/del/chg/more, rendered below
+      cdchg)   ;;   # phase = add/del/chg/key/more, rendered below
       *)    icon="·"; color="$DIM";    phase="-"; name="-" ;;
     esac
     [[ "$kind" == "wait" ]] && note="${YELLOW}${note}${NC}"
@@ -1089,7 +1129,7 @@ _argo_wf_build() {
               h_old="${h_old//$h_o/${hl_r}}"; h_old="${h_old//$h_e/${RED}}"
               h_new="${h_new//$h_n/${hl_g}}"; h_new="${h_new//$h_e/${GREEN}}"
               note="${note%%: *}: ${RED}${h_old}${YELLOW} → ${GREEN}${h_new}${NC}" ;;
-        *)    note="${DIM}${note}${NC}" ;;
+        *)    note="${DIM}${note}${NC}" ;;   # key (path header) / more
       esac
       line=$(printf "%-${w_ns}s   %s %-9s   %s" "" " " "" "      ${note}")
       list+="${url}"$'\t'"$(printf '%b' "$line")"$'\n'
