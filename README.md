@@ -106,13 +106,14 @@ PUT /api/v1/workflows/<namespace>/<name>/resume
 
 so the server records you as the one who resumed it, and your usual RBAC applies. Before anything is sent the tool re-checks that the workflow still waits, and asks for confirmation.
 
-**Batches.** If the suspended node was expanded from a loop over items that have a `batch` key — its node name then looks like `deploy(2:batch:prod,…)` — the batch name is shown (`waiting for approval: prod`) and used below. Batches listed in `ARGO_WF_PROD_BATCHES` (default `prod`) need a second confirmation: you have to type the batch name.
+**Batches.** If the suspended node was expanded from a loop over items that have a `batch` key — its node name then looks like `deploy(2:batch:prod,…)` — the batch name is shown (`waiting for approval: prod`) and used below. Batches listed in `ARGO_WF_PROD_BATCHES` (default `prod`) need a second confirmation: you have to type the batch name. A batch that is a path — `aws/prod/account-1` — counts as well when one of its `/`-separated segments is listed; you then type that segment (`prod`).
 
 ## What is out of sync (Argo CD)
 
 For every waiting workflow the tool looks up the Argo CD applications that belong to it and lists the resources that actually differ, with a compact `key: old → new` diff (changed part highlighted). Multi-line values — a ConfigMap's `config.yaml`, say — are compared line by line under a `data.config.yaml:` heading, so you see the lines that changed, not the whole file.
 
 - Applications are found by **label selector** `ARGOCD_SELECTOR`, default `app={namespace},batch={batch}` — `{namespace}` is the workflow's namespace, `{batch}` the batch it waits on (terms with `{batch}` are dropped when there is none). Adjust it to however your applications are labelled.
+- Namespaces whose workflows do not deploy through Argo CD — Terraform runs, say — go into `ARGOCD_SKIP_NAMESPACES` (shell patterns, e.g. `infra-* tf-network`): their workflows are listed and approved like any other, just without the lookup.
 - Keys in `ARGOCD_DIFF_IGNORE` (default `labels`) are removed from both sides before comparing — a chart version bump that only touches labels is noise. Applications that differ *only* there are treated as synced.
 - Diffs longer than `ARGOCD_DIFF_LINES` (default 5, headings not counted) collapse into `… N changes`; press Enter on the resource to see the full diff in the Argo CD UI.
 - Authentication is the `argocd` CLI's own: if you are not signed in, a row offers `argocd login <server> --sso`.
@@ -132,6 +133,7 @@ Everything lives in `~/.config/argo-wf/config` (mode `600`, plain `KEY="value"` 
 | `ARGO_WF_INSECURE` | – | `1` = skip TLS verification (`curl -k`) |
 | `ARGOCD_SERVER` | – | Argo CD host name; empty = feature off |
 | `ARGOCD_SELECTOR` | `app={namespace},batch={batch}` | label selector for a workflow's applications |
+| `ARGOCD_SKIP_NAMESPACES` | – | namespaces (shell patterns) without Argo CD applications |
 | `ARGOCD_FLAGS` | `--grpc-web` | extra flags for the `argocd` CLI |
 | `ARGOCD_DIFF_LINES` | `5` | longer diffs collapse |
 | `ARGOCD_DIFF_IGNORE` | `labels` | keys dropped from both sides of a diff |

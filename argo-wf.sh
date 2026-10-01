@@ -20,7 +20,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # ─── Colors & helpers ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -358,9 +358,10 @@ CONFIG_FILE="${ARGO_WF_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/argo-wf/config}
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/argo-wf"
 CONFIG_VARS="ARGO_WF_SERVER ARGO_WF_NAMESPACES ARGO_WF_LIMIT ARGO_WF_REFRESH ARGO_WF_IDLE
              ARGO_WF_PROD_BATCHES ARGO_WF_INSECURE ARGOCD_SERVER ARGOCD_SELECTOR
-             ARGOCD_FLAGS ARGOCD_DIFF_LINES ARGOCD_DIFF_IGNORE"
+             ARGOCD_SKIP_NAMESPACES ARGOCD_FLAGS ARGOCD_DIFF_LINES ARGOCD_DIFF_IGNORE"
 
 NAMESPACES=()
+ARGOCD_SKIP=()
 ARGO_TOKEN_ALT=""
 CURL_OPTS=()
 
@@ -423,9 +424,14 @@ config_apply() {
   ARGOCD_SERVER="${ARGOCD_SERVER%/}"
   # shellcheck disable=SC2206
   NAMESPACES=(${ARGO_WF_NAMESPACES//,/ })
+  # patterns, not file names: no pathname expansion while splitting
+  set -f
+  # shellcheck disable=SC2206
+  ARGOCD_SKIP=(${ARGOCD_SKIP_NAMESPACES//,/ })
+  set +f
   CURL_OPTS=()
   [[ "${ARGO_WF_INSECURE:-}" == "1" ]] && CURL_OPTS=(-k)
-  CACHE_KEY=$(printf '%s' "${VERSION}|${ARGO_WF_SERVER}|${NAMESPACES[*]:-}|${ARGOCD_SERVER}|${ARGOCD_SELECTOR}" | cksum | awk '{print $1}')
+  CACHE_KEY=$(printf '%s' "${VERSION}|${ARGO_WF_SERVER}|${NAMESPACES[*]:-}|${ARGOCD_SERVER}|${ARGOCD_SELECTOR}|${ARGOCD_SKIP_NAMESPACES}" | cksum | awk '{print $1}')
 }
 
 # First run / --setup: three short prompts, all optional to change.
@@ -649,8 +655,20 @@ _argo_wf_waiting() {
 # Applications are matched by label selector ARGOCD_SELECTOR, where
 # {namespace} = the workflow's namespace and {batch} = the batch the workflow
 # waits on; terms with {batch} are dropped when there is no batch.
+# Namespaces matching a shell pattern in ARGOCD_SKIP_NAMESPACES are left out:
+# their workflows do not deploy through Argo CD (Terraform runs, say), so
+# there is nothing to look up underneath.
 argocd_enabled() {
   [[ -n "${ARGOCD_SERVER:-}" ]] && command -v argocd >/dev/null
+}
+
+_argocd_skipped() {
+  local pat
+  for pat in ${ARGOCD_SKIP[@]+"${ARGOCD_SKIP[@]}"}; do
+    # shellcheck disable=SC2053
+    [[ "$1" == $pat ]] && return 0
+  done
+  return 1
 }
 
 _argocd_selector() {
@@ -893,19 +911,26 @@ argo_wf_approve() {
 ✔  Yes, approve ${what}" "confirm" \
     "PUT /api/v1/workflows/${ns}/${name}/resume (${n}) · Enter = select · Esc = back" || return 0
   [[ "$UI_RESULT" == "✔"* ]] || return 0
-  # production batches (ARGO_WF_PROD_BATCHES) need the batch name typed out
-  local pb
+  # production batches (ARGO_WF_PROD_BATCHES) need the batch name typed out;
+  # a batch that is a path counts when one of its segments is listed
+  # ("aws/prod/account-1") — then that segment is what has to be typed
+  local pb word=""
   for pb in $ARGO_WF_PROD_BATCHES; do
-    if [[ -n "$b" && "$b" == "$pb" ]]; then
-      UI_TITLE="PRODUCTION — ${name}"
-      ui_input "type “${b}”" "Production batch — type its name (${b}) and press Enter to go ahead · Esc = back" || return 0
-      if [[ "$UI_RESULT" != "$b" ]]; then
-        section "Approval — ${ns}/${name}"
-        sline "${YELLOW}⚠${NC}" "No match (“${UI_RESULT}” ≠ “${b}”) — cancelled, nothing sent."
-        pause_close; return 0
-      fi
-    fi
+    [[ -n "$b" && -z "$word" && "/${b}/" == *"/${pb}/"* ]] && word="$pb"
   done
+  if [[ -n "$word" ]]; then
+    UI_TITLE="PRODUCTION — ${name}"
+    if [[ "$word" == "$b" ]]; then
+      ui_input "type “${word}”" "Production batch — type its name (${word}) and press Enter to go ahead · Esc = back" || return 0
+    else
+      ui_input "type “${word}”" "Production batch ${b} — type “${word}” and press Enter to go ahead · Esc = back" || return 0
+    fi
+    if [[ "$UI_RESULT" != "$word" ]]; then
+      section "Approval — ${ns}/${name}"
+      sline "${YELLOW}⚠${NC}" "No match (“${UI_RESULT}” ≠ “${word}”) — cancelled, nothing sent."
+      pause_close; return 0
+    fi
+  fi
   local body
   body=$(jq -cn --arg n "$name" --arg ns "$ns" --arg sel "displayName=${n},phase=Running" \
     '{name: $n, namespace: $ns, nodeFieldSelector: $sel}')
@@ -1015,7 +1040,7 @@ _argo_wf_build() {
       [[ "$kind" == "wait" ]] && rowurl="__WAIT__ ${ns} ${name} ${ARGO_WAIT_BATCH:--} ${url}/${name} ${ARGO_WAIT_NODE}"
       recs+="${kind}${S}${ns}${S}${phase}${S}${name}${S}${age}${S}${dur}${S}${prog}${S}${note}${S}${rowurl}"$'\n'
       # under a waiting workflow: the Argo CD applications it is about to change
-      if [[ "$kind" == "wait" ]] && argocd_enabled; then
+      if [[ "$kind" == "wait" ]] && argocd_enabled && ! _argocd_skipped "$ns"; then
         local batch="$ARGO_WAIT_BATCH" sel cdk cda cdb cdc cdd cd_real=0
         sel=$(_argocd_selector "$ns" "$batch")
         _argo_prog "${CYAN}▸${NC}" "Argo CD: ${sel} …"
@@ -1458,7 +1483,8 @@ Usage: ${0##*/} [options]
 Settings are remembered in the config file; every option also exists as an
 environment variable (ARGO_WF_SERVER, ARGO_WF_NAMESPACES, ARGOCD_SERVER, …).
 Tunables: ARGO_WF_REFRESH (s, 0 = off), ARGO_WF_LIMIT, ARGO_WF_PROD_BATCHES,
-ARGO_WF_INSECURE=1, ARGOCD_SELECTOR, ARGOCD_DIFF_LINES, ARGOCD_DIFF_IGNORE.
+ARGO_WF_INSECURE=1, ARGOCD_SELECTOR, ARGOCD_SKIP_NAMESPACES, ARGOCD_DIFF_LINES,
+ARGOCD_DIFF_IGNORE.
 EOF
 }
 
