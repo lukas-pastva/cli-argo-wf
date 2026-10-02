@@ -5,8 +5,9 @@
 # Talks to the argo-server REST API with your SSO bearer token, so it works
 # for clusters you cannot reach with kubectl. Shows what is running in the
 # namespaces you care about, which workflows are parked on a suspend node
-# (an approval gate), lets you approve them from the terminal and — when an
-# Argo CD server is configured — shows what exactly is out of sync underneath.
+# (an approval gate), lets you approve them from the terminal and shows what
+# you are approving: what is out of sync in Argo CD (when a server is
+# configured) or the Terraform / OpenTofu plan the workflow made.
 #
 # Single file, no installation: bash 3.2+, fzf 0.45+, curl, jq.
 # Optional: the `argocd` CLI for the out-of-sync view.
@@ -20,7 +21,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 # ─── Colors & helpers ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -357,11 +358,13 @@ ui_paste() {
 CONFIG_FILE="${ARGO_WF_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/argo-wf/config}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/argo-wf"
 CONFIG_VARS="ARGO_WF_SERVER ARGO_WF_NAMESPACES ARGO_WF_LIMIT ARGO_WF_REFRESH ARGO_WF_IDLE
-             ARGO_WF_PROD_BATCHES ARGO_WF_INSECURE ARGOCD_SERVER ARGOCD_SELECTOR
+             ARGO_WF_PROD_BATCHES ARGO_WF_INSECURE ARGO_WF_PLAN_NODES ARGO_WF_PLAN_LINES
+             ARGOCD_SERVER ARGOCD_SELECTOR
              ARGOCD_SKIP_NAMESPACES ARGOCD_FLAGS ARGOCD_DIFF_LINES ARGOCD_DIFF_IGNORE"
 
 NAMESPACES=()
 ARGOCD_SKIP=()
+PLAN_PATTERNS=()
 ARGO_TOKEN_ALT=""
 CURL_OPTS=()
 
@@ -411,6 +414,8 @@ config_apply() {
   : "${ARGO_WF_REFRESH:=120}"       # auto-refresh in seconds, 0 = off
   : "${ARGO_WF_IDLE:=5}"            # no refresh while you were active this recently
   : "${ARGO_WF_PROD_BATCHES:=prod}" # batches that need a typed confirmation
+  : "${ARGO_WF_PLAN_NODES:=*plan*}" # steps whose log holds a Terraform plan, "-" = off
+  : "${ARGO_WF_PLAN_LINES:=10}"     # changed lines listed per resource
   # (not ${VAR:=…}: the first "}" of the placeholders would end the expansion)
   [[ -n "$ARGOCD_SELECTOR" ]] || ARGOCD_SELECTOR='app={namespace},batch={batch}'
   : "${ARGOCD_FLAGS:=--grpc-web}"
@@ -428,10 +433,12 @@ config_apply() {
   set -f
   # shellcheck disable=SC2206
   ARGOCD_SKIP=(${ARGOCD_SKIP_NAMESPACES//,/ })
+  # shellcheck disable=SC2206
+  PLAN_PATTERNS=(${ARGO_WF_PLAN_NODES//,/ })
   set +f
   CURL_OPTS=()
   [[ "${ARGO_WF_INSECURE:-}" == "1" ]] && CURL_OPTS=(-k)
-  CACHE_KEY=$(printf '%s' "${VERSION}|${ARGO_WF_SERVER}|${NAMESPACES[*]:-}|${ARGOCD_SERVER}|${ARGOCD_SELECTOR}|${ARGOCD_SKIP_NAMESPACES}" | cksum | awk '{print $1}')
+  CACHE_KEY=$(printf '%s' "${VERSION}|${ARGO_WF_SERVER}|${NAMESPACES[*]:-}|${ARGOCD_SERVER}|${ARGOCD_SELECTOR}|${ARGOCD_SKIP_NAMESPACES}|${ARGO_WF_PLAN_NODES}|${ARGO_WF_PLAN_LINES}" | cksum | awk '{print $1}')
 }
 
 # First run / --setup: three short prompts, all optional to change.
@@ -488,6 +495,19 @@ _argo_api() {
   fi
   ARGO_HTTP_CODE="${out##*$'\n'}"
   ARGO_BODY="${out%$'\n'*}"
+  [[ "$ARGO_HTTP_CODE" == "200" ]]
+}
+
+# _argo_api_file <path> <file> — like _argo_api, but the body goes to a file
+# (an archived log can be large).
+_argo_api_file() {
+  local code
+  if ! code=$(printf 'header = "Authorization: %s"\n' "${ARGO_TOKEN:-}" \
+              | curl -sS --max-time 60 ${CURL_OPTS[@]+"${CURL_OPTS[@]}"} -K - \
+                     -o "$2" -w '%{http_code}' "${ARGO_WF_SERVER}${1}" 2>/dev/null); then
+    ARGO_HTTP_CODE="000"; return 1
+  fi
+  ARGO_HTTP_CODE="$code"
   [[ "$ARGO_HTTP_CODE" == "200" ]]
 }
 
@@ -625,15 +645,26 @@ _argo_ns_rows() {
 # ARGO_WAIT_NODE = displayName of the first such node (what "approve"
 # resumes). When the node comes from a loop over items with a `batch` key —
 # node name "deploy(2:batch:prod,…)" — the batch lands in ARGO_WAIT_BATCH.
+# ARGO_WAIT_PLAN = the step that planned what is being approved, if there is
+# one, as "<node id>@<finished at>": a finished pod with an archived log whose
+# name matches ARGO_WF_PLAN_NODES. Among several the one whose node name
+# shares the longest prefix with the suspended node wins (the same loop item
+# — the same batch), then the one that finished last.
 ARGO_WAIT=""
 ARGO_WAIT_BATCH=""
 ARGO_WAIT_NODE=""
+ARGO_WAIT_PLAN=""
 _argo_wf_waiting() {
-  ARGO_WAIT=""; ARGO_WAIT_BATCH=""; ARGO_WAIT_NODE=""
+  ARGO_WAIT=""; ARGO_WAIT_BATCH=""; ARGO_WAIT_NODE=""; ARGO_WAIT_PLAN=""
   _argo_api "/api/v1/workflows/${1}/${2}?fields=status.nodes" || return 0
-  local line display batch parts=""
-  while IFS=$'\t' read -r display batch; do
+  local line tag display batch parts=""
+  while IFS=$'\t' read -r tag display batch; do
     [[ -n "$display" ]] || continue
+    if [[ "$tag" == "P" ]]; then
+      # P <node id>@<finished at> <displayName>, best candidate first
+      [[ -z "$ARGO_WAIT_PLAN" ]] && _plan_node_match "$batch" && ARGO_WAIT_PLAN="$display"
+      continue
+    fi
     [[ -z "$ARGO_WAIT_NODE" ]] && ARGO_WAIT_NODE="$display"
     [[ -z "$ARGO_WAIT_BATCH" && -n "$batch" ]] && ARGO_WAIT_BATCH="$batch"
     if [[ "$display" == approv* ]]; then
@@ -643,9 +674,20 @@ _argo_wf_waiting() {
     fi
     parts+="${parts:+ · }${line}"
   done < <(jq -r '
-    (.status.nodes // {}) | to_entries[] | .value
-    | select(.type == "Suspend" and .phase == "Running")
-    | [ .displayName, ((.name | capture("batch:(?<b>[^,)]+)") | .b) // "") ]
+    def cpl($x; $y): ([($x | length), ($y | length)] | min) as $n
+      | first(range(0; $n) | select($x[.] != $y[.])) // $n;
+    [ (.status.nodes // {})[] ] as $nodes
+    | [ $nodes[] | select(.type == "Suspend" and .phase == "Running") ] as $sus
+    | ( $sus[] | [ "S", .displayName, ((.name | capture("batch:(?<b>[^,)]+)") | .b) // "") ] ),
+      ( if ($sus | length) == 0 then empty else
+          ($sus[0].name | explode) as $sn
+          | [ $nodes[]
+              | select(.type == "Pod" and .phase == "Succeeded"
+                       and any(.outputs.artifacts[]?; .name == "main-logs"))
+              | { id, displayName, finishedAt, cpl: cpl($sn; (.name | explode)) } ]
+          | sort_by(.cpl, .finishedAt) | reverse | .[]
+          | [ "P", "\(.id)@\(.finishedAt // "")", .displayName ]
+        end )
     | @tsv' <<< "$ARGO_BODY" 2>/dev/null)
   ARGO_WAIT="$parts"
 }
@@ -880,23 +922,329 @@ _argocd_oos_rows() {
       end' <<< "$json" 2>/dev/null) || ARGOCD_ROWS="cderr${S}jq parse error"
 }
 
+# ─── Terraform / OpenTofu: the plan under a waiting workflow ─────────
+# A workflow that runs Terraform parks on its approval gate after a plan
+# step. That step is looked up among the workflow's finished pods — name
+# matching ARGO_WF_PLAN_NODES, the one closest to the suspended node (same
+# loop item), see _argo_wf_waiting — and the plan is read from its archived
+# log (artifact "main-logs", so the server has to archive logs). Plain
+# terraform/tofu output is understood as well as Terragrunt's, where every
+# line carries "<time> STDOUT [unit] tofu: " and units interleave.
+#
+# The parsed plan is kept in CACHE_DIR (the pod is finished, its log does not
+# change); records, separator \x1f, grouped by unit:
+#   U<S>unit<S>changes|outputs|nochange<S>add<S>change<S>destroy<S>summary
+#   R<S>symbol<S>address<S>what happens     one resource
+#   A<S>text                                a changed line of an updated resource
+#   L<S>text                                the plan as printed, line by line
+PLAN_PARSER_VER=1
+PLAN_MAX_RES=30   # resources listed per unit in the table; the viewer has all
+PLAN_FILE=""
+PLAN_ERR=""
+PLAN_UNITS=0
+PLAN_CHANGED=0
+PLAN_DEL=0
+PLAN_TOTAL=""
+
+_plan_node_match() {
+  local pat
+  for pat in ${PLAN_PATTERNS[@]+"${PLAN_PATTERNS[@]}"}; do
+    # shellcheck disable=SC2053
+    [[ "$1" == $pat ]] && return 0
+  done
+  return 1
+}
+
+# _plan_parse — log on stdin, records on stdout.
+_plan_parse() {
+  LC_ALL=C awk -v S=$'\x1f' '
+    BEGIN {
+      ANSI = sprintf("%c", 27) "\\[[0-9;]*[A-Za-z]"
+      SP = "                                                            "
+      nu = 0
+    }
+    function uidx(u) {
+      if (!(u in idx)) { idx[u] = ++nu; uname[nu] = u; ustat[nu] = "" }
+      return idx[u]
+    }
+    function put(i, rec) { ubuf[i] = ubuf[i] rec "\n" }
+    # the number in front of " to <what>" ("2 to add, 1 to change, …")
+    function num(s, what,   t) {
+      if (!match(s, "[0-9]+ to " what)) return 0
+      t = substr(s, RSTART, RLENGTH); sub(/ .*/, "", t)
+      return t + 0
+    }
+    {
+      line = $0
+      sub(/\r$/, "", line); gsub(ANSI, "", line); gsub(/\t/, "    ", line)
+      unit = ""
+      if (line ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]+ +[A-Z]+ /) {
+        # Terragrunt: only what the tool printed, minus the prefix
+        sub(/^[0-9:.]+ +/, "", line)
+        if (line !~ /^STDOUT /) next
+        sub(/^STDOUT +/, "", line)
+        if (match(line, /^\[[^]]*\] /)) {
+          unit = substr(line, 2, RLENGTH - 3); line = substr(line, RLENGTH + 1)
+        }
+        sub(/^(tofu|terraform|opentofu): ?/, "", line)
+      }
+      i = uidx(unit)
+
+      if (line ~ /^No changes\./) { if (ustat[i] == "") ustat[i] = "nochange"; next }
+      if (line ~ /will perform the following actions:$/) { cap[i] = 1; ustat[i] = "changes"; next }
+      if (line ~ /^Changes to Outputs:/) {
+        cap[i] = 2; nout[i] = 0
+        if (ustat[i] != "changes") ustat[i] = "outputs"
+        put(i, "L" S line); next
+      }
+      if (line ~ /^Plan: /) {
+        s = line; sub(/^Plan: /, "", s); sub(/\.$/, "", s)
+        usum[i] = s; ustat[i] = "changes"; cap[i] = 0; inres[i] = 0
+        uadd[i] = num(s, "add"); uchg[i] = num(s, "change"); udel[i] = num(s, "destroy")
+        next
+      }
+      if (cap[i] == 1) {
+        if (line ~ /^ *$/) next
+        put(i, "L" S line)
+        if (line ~ /^  # / && line !~ /^  # \(/) {
+          # "  # <address> will be created" and friends
+          t = substr(line, 5)
+          if (match(t, / (will be|must be|is tainted|has moved|will no longer|will not be|has been) /)) {
+            haddr[i] = substr(t, 1, RSTART - 1); hdesc[i] = substr(t, RSTART + 1)
+          } else { haddr[i] = t; hdesc[i] = "" }
+          inres[i] = 0
+          next
+        }
+        if (haddr[i] != "" && line ~ /^ *([-+~<=\/]+ )?(resource|data) "/) {
+          sym = line; sub(/^ */, "", sym)
+          if (sym ~ /^(resource|data) /) sym = ""; else sub(/ .*/, "", sym)
+          put(i, "R" S sym S haddr[i] S hdesc[i]); haddr[i] = ""
+          # changed lines are worth listing only where something is kept
+          inres[i] = (sym == "~" || sym ~ /\//)
+          next
+        }
+        if (inres[i]) {
+          t = line; sub(/^ */, "", t)
+          if (t ~ /^([-+~]|-\/\+|\+\/-) /) {
+            rel = match(line, /[^ ]/) - 7; if (rel < 0) rel = 0
+            put(i, "A" S substr(SP, 1, rel) t)
+          }
+        }
+        next
+      }
+      if (cap[i] == 2) {
+        if (line ~ /^ +[^ ]/) { put(i, "L" S line); nout[i]++; next }
+        if (line ~ /^ *$/ && nout[i] == 0) next
+        cap[i] = 0
+      }
+    }
+    END {
+      for (i = 1; i <= nu; i++) {
+        if (ustat[i] == "") continue
+        if (ustat[i] == "outputs") usum[i] = "outputs change"
+        print "U" S uname[i] S ustat[i] S (uadd[i] + 0) S (uchg[i] + 0) S (udel[i] + 0) S usum[i]
+        printf "%s", ubuf[i]
+      }
+    }'
+}
+
+# _plan_load <ns> <workflow> <plan step> — PLAN_FILE = the parsed plan (fetched
+# and parsed on first use), totals in PLAN_UNITS / PLAN_CHANGED / PLAN_DEL /
+# PLAN_TOTAL. PLAN_UNITS = 0: that log holds no plan. rc 1 = PLAN_ERR.
+# The step comes as "<node id>@<finished at>" (ARGO_WAIT_PLAN); the time is
+# part of the cache key, so a workflow started again under the same name
+# never gets the plan of its predecessor.
+_plan_load() {
+  local ns="$1" wf="$2" node="${3%%@*}" S=$'\x1f' key raw um
+  PLAN_ERR=""; PLAN_UNITS=0; PLAN_CHANGED=0; PLAN_DEL=0; PLAN_TOTAL=""
+  key=$(printf '%s' "${PLAN_PARSER_VER}|${ARGO_WF_SERVER}|${ns}|${wf}|${3}" | cksum | awk '{print $1}')
+  PLAN_FILE="${CACHE_DIR}/plan-${key}"
+  if [[ ! -s "$PLAN_FILE" ]]; then
+    # a plan names what is deployed where: neither copy is for other users
+    um=$(umask); umask 077
+    mkdir -p "$CACHE_DIR" 2>/dev/null
+    raw="${TMP_PREFIX}.plan.${key}.${RANDOM}"
+    if ! _argo_api_file "/artifact-files/${ns}/workflows/${wf}/${node}/outputs/main-logs" "$raw"; then
+      if [[ "$ARGO_HTTP_CODE" == "000" ]]; then PLAN_ERR="the log of the plan step could not be fetched"
+      else PLAN_ERR="the log of the plan step: HTTP ${ARGO_HTTP_CODE}"; fi
+      rm -f "$raw"; umask "$um"; return 1
+    fi
+    { printf 'V%s%s\n' "$S" "$PLAN_PARSER_VER"; _plan_parse < "$raw"; } > "${PLAN_FILE}.tmp.$$" \
+      && mv "${PLAN_FILE}.tmp.$$" "$PLAN_FILE"
+    rm -f "$raw"; umask "$um"
+  fi
+  local add chg outs
+  # shellcheck disable=SC2046
+  set -- $(awk -F"$S" '$1 == "U" { u++; if ($3 != "nochange") c++; if ($3 == "outputs") o++
+                                   a += $4; g += $5; d += $6 }
+                       END { print u + 0, c + 0, a + 0, g + 0, d + 0, o + 0 }' "$PLAN_FILE" 2>/dev/null)
+  PLAN_UNITS="${1:-0}"; PLAN_CHANGED="${2:-0}"; add="${3:-0}"; chg="${4:-0}"; PLAN_DEL="${5:-0}"; outs="${6:-0}"
+  if (( PLAN_CHANGED == 0 )); then PLAN_TOTAL="no changes"
+  elif (( add + chg + PLAN_DEL == 0 && outs > 0 )); then PLAN_TOTAL="outputs change"
+  else PLAN_TOTAL="${add} to add, ${chg} to change, ${PLAN_DEL} to destroy"; fi
+  return 0
+}
+
+# "2 to add, 1 to change, 0 to destroy" with each part in its color; parts
+# that are zero stay dim, so a destroy stands out.
+_plan_sum_color() {
+  local part c out="" IFS=','
+  for part in $1; do
+    part="${part# }"
+    case "$part" in
+      0\ to\ *)   c="$DIM" ;;
+      *add)       c="$GREEN" ;;
+      *change)    c="$YELLOW" ;;
+      *destroy)   c='\033[1;31m' ;;
+      *)          c="" ;;
+    esac
+    out+="${out:+${DIM}, ${NC}}${c}${part}${NC}"
+  done
+  printf '%s' "$out"
+}
+
+# _plan_recs <ns> <workflow> <plan step> — table rows for the plan, appended to
+# the caller's recs (bash scoping is dynamic): a total, then per changed unit
+# its resources and, for the ones updated or replaced, the lines that change
+# (at most ARGO_WF_PLAN_LINES each). Enter on a row opens the viewer.
+_plan_recs() {
+  local ns="$1" wf="$2" node="$3" key="__PLAN__ $1 $2 $3" S=$'\x1f'
+  if ! _plan_load "$ns" "$wf" "$node"; then
+    recs+="tferr${S}${S}Plan${S}-${S}${S}${S}${S}${PLAN_ERR}${S}"$'\n'
+    return 0
+  fi
+  (( PLAN_UNITS > 0 )) || return 0
+  local units="${PLAN_UNITS} units"; (( PLAN_UNITS == 1 )) && units="1 unit"
+  if (( PLAN_CHANGED == 0 )); then
+    recs+="tfok${S}${S}Plan${S}-${S}${S}${S}${S}no changes (${units})${S}${key}"$'\n'
+    return 0
+  fi
+  local what="-"
+  (( PLAN_UNITS > 1 )) && what="${PLAN_CHANGED} of ${units}"
+  recs+="tfsum${S}${S}Plan${S}${what}${S}${S}${S}${S}${PLAN_TOTAL}${S}${key}"$'\n'
+  local t f2 f3 f4 f5 f6 f7 ui=0 show=0 nres=0 nattr=0 more_res=0 more_attr=0
+  while IFS="$S" read -r t f2 f3 f4 f5 f6 f7; do
+    case "$t" in
+      U|R)
+        if (( more_attr > 0 )); then
+          recs+="tfmore${S}${S}${S}${S}${S}${S}${S}    … ${more_attr} more lines${S}__SKIP__"$'\n'
+        fi
+        nattr=0; more_attr=0 ;;
+    esac
+    case "$t" in
+      U)
+        if (( more_res > 0 )); then
+          recs+="tfmore${S}${S}${S}${S}${S}${S}${S}… ${more_res} more resources${S}__SKIP__"$'\n'
+        fi
+        ui=$((ui + 1)); nres=0; more_res=0; show=0
+        [[ "$f3" == "nochange" ]] && continue
+        show=1
+        if (( PLAN_UNITS > 1 )) || [[ -n "$f2" ]]; then
+          recs+="tfunit${S}${S}${S}${f2:-.}${S}${S}${S}${S}${f7}${S}${key} ${ui}"$'\n'
+        fi ;;
+      R)
+        (( show )) || continue
+        nres=$((nres + 1))
+        if (( nres > PLAN_MAX_RES )); then more_res=$((more_res + 1)); show=2; continue; fi
+        show=1
+        # what happens is spelled out only where the symbol does not say it all
+        case "$f2" in +|-|"~") f4="" ;; esac
+        recs+="tfres${S}${S}${f2}${S}${S}${S}${S}${S}${f2:-→} ${f3}${f4:+  ${f4}}${S}${key} ${ui}"$'\n' ;;
+      A)
+        (( show == 1 )) || continue
+        nattr=$((nattr + 1))
+        if (( nattr > ARGO_WF_PLAN_LINES )); then more_attr=$((more_attr + 1)); continue; fi
+        recs+="tfchg${S}${S}${S}${S}${S}${S}${S}    ${f2}${S}__SKIP__"$'\n' ;;
+    esac
+  done < "$PLAN_FILE"
+  if (( more_attr > 0 )); then
+    recs+="tfmore${S}${S}${S}${S}${S}${S}${S}    … ${more_attr} more lines${S}__SKIP__"$'\n'
+  fi
+  if (( more_res > 0 )); then
+    recs+="tfmore${S}${S}${S}${S}${S}${S}${S}… ${more_res} more resources${S}__SKIP__"$'\n'
+  fi
+  return 0
+}
+
+# argo_wf_plan <ns> <workflow> <plan step> [unit number] — the plan as it was
+# printed, in a panel: all units with changes, or just the given one. Typing
+# filters the lines ("destroy", a resource name, …).
+argo_wf_plan() {
+  local ns="$1" wf="$2" node="$3" only="${4:-0}" S=$'\x1f' list
+  if ! _plan_load "$ns" "$wf" "$node"; then
+    section "Plan — ${ns}/${wf}"
+    sline "${RED}✖${NC}" "No plan to show: ${PLAN_ERR}"
+    pause_close; return 0
+  fi
+  list=$(awk -F"$S" -v only="$only" -v multi="$PLAN_UNITS" \
+             -v G=$'\033[0;32m' -v R=$'\033[0;31m' -v Y=$'\033[1;33m' -v C=$'\033[0;36m' \
+             -v B=$'\033[1m' -v D=$'\033[2m' -v N=$'\033[0m' '
+    $1 == "U" {
+      u++; show = 0
+      if ($3 == "nochange") { if (!only) same = same (same == "" ? "" : "\n") D "  " ($2 == "" ? "." : $2) N; nsame++; next }
+      if (only && u != only) next
+      show = 1
+      if (printed++) print " "
+      if (multi > 1 || $2 != "") print B C "▌ " ($2 == "" ? "." : $2) N D "  —  " $7 N
+      next
+    }
+    $1 == "L" && show {
+      t = $2; s = t; sub(/^ */, "", s)
+      gsub(/# forces replacement/, R "&" N, t)
+      if (s ~ /^# /) {
+        if (s ~ /destroyed|replaced/) print B R t N; else print B t N
+      }
+      else if (s ~ /^(-\/\+|\+\/-) /) print R t N
+      else if (s ~ /^\+ /) print G t N
+      else if (s ~ /^- /)  print R t N
+      else if (s ~ /^~ /)  print Y t N
+      else if (s ~ /^<= /) print C t N
+      else print t
+    }
+    END {
+      if (nsame) {
+        if (printed) print " "
+        print D "No changes in " nsame (nsame == 1 ? " unit:" : " units:") N
+        print same
+      }
+    }' "$PLAN_FILE")
+  if [[ -z "$list" ]]; then
+    section "Plan — ${ns}/${wf}"
+    sline "${YELLOW}⚠${NC}" "The log of that step holds no plan."
+    pause_close; return 0
+  fi
+  UI_TITLE="Plan — ${wf}"
+  UI_EXTRA_OPTS=(--ansi --exact)
+  _fzf_at_least 0 54 && UI_EXTRA_OPTS+=(--wrap)
+  ui_select "$list" "filter" "${ns}/${wf} · ${PLAN_TOTAL} · type to filter the lines · Enter / Esc = back"
+  return 0
+}
+
 # ─── Approve from the terminal ───────────────────────────────────────
-# argo_wf_approve <ns> <name> <batch|-> <url> <node> — submenu for a waiting
-# workflow. Approving = resuming the suspended node, the same request the
-# Resume button of the web UI sends (your name ends up in the node message).
+# argo_wf_approve <ns> <name> <batch|-> <url> <plan step|-> <node> — submenu
+# for a waiting workflow. Approving = resuming the suspended node, the same
+# request the Resume button of the web UI sends (your name ends up in the
+# node message).
 argo_wf_approve() {
-  local ns="$1" name="$2" batch="$3" url="$4" node="$5"
+  local ns="$1" name="$2" batch="$3" url="$4" plan="$5" node="$6"
   [[ "$batch" == "-" ]] && batch=""
-  UI_TITLE="Argo WF — ${name}"
+  [[ "$plan" == "-" ]] && plan=""
   local what="${batch:+batch ${batch}}"; what="${what:-${node}}"
-  local items="✔  Approve ${what} (resume ${node})
-↗  Open in the browser"
-  ui_select "$items" "wf" "${ns}/${name} is waiting: ${what} · Enter = select · Esc = back" || return 0
-  case "$UI_RESULT" in
-    "↗"*) _open_url "$url"; return 0 ;;
-    "✔"*) ;;
-    *) return 0 ;;
-  esac
+  local items="✔  Approve ${what} (resume ${node})"
+  if [[ -n "$plan" ]] && _plan_load "$ns" "$name" "$plan" && (( PLAN_UNITS > 0 )); then
+    items+=$'\n'"≡  Show the plan (${PLAN_TOTAL})"
+  fi
+  items+=$'\n'"↗  Open in the browser"
+  while true; do
+    UI_TITLE="Argo WF — ${name}"
+    ui_select "$items" "wf" "${ns}/${name} is waiting: ${what} · Enter = select · Esc = back" || return 0
+    case "$UI_RESULT" in
+      "≡"*) argo_wf_plan "$ns" "$name" "$plan" ;;
+      "↗"*) _open_url "$url"; return 0 ;;
+      "✔"*) break ;;
+      *) return 0 ;;
+    esac
+  done
   # check once more that the workflow still sits on a suspend node
   _argo_wf_waiting "$ns" "$name"
   if [[ -z "$ARGO_WAIT" ]]; then
@@ -904,12 +1252,16 @@ argo_wf_approve() {
     sline "${YELLOW}⚠${NC}" "The workflow is no longer waiting (it moved on meanwhile) — nothing sent."
     pause_close; return 0
   fi
-  local b="${ARGO_WAIT_BATCH:-$batch}" n="${ARGO_WAIT_NODE:-$node}"
+  local b="${ARGO_WAIT_BATCH:-$batch}" n="${ARGO_WAIT_NODE:-$node}" plan_note=""
   what="${b:+batch ${b}}"; what="${what:-${n}}"
+  # the plan of what waits now (not of the row that was on screen)
+  if [[ -n "$ARGO_WAIT_PLAN" ]] && _plan_load "$ns" "$name" "$ARGO_WAIT_PLAN" && (( PLAN_UNITS > 0 )); then
+    plan_note=" · plan: ${PLAN_TOTAL}"
+  fi
   UI_TITLE="Approval — ${name}"
   ui_select "✖  No, go back
 ✔  Yes, approve ${what}" "confirm" \
-    "PUT /api/v1/workflows/${ns}/${name}/resume (${n}) · Enter = select · Esc = back" || return 0
+    "PUT /api/v1/workflows/${ns}/${name}/resume (${n})${plan_note} · Enter = select · Esc = back" || return 0
   [[ "$UI_RESULT" == "✔"* ]] || return 0
   # production batches (ARGO_WF_PROD_BATCHES) need the batch name typed out;
   # a batch that is a path counts when one of its segments is listed
@@ -982,7 +1334,7 @@ _argo_flush_diff() {
 # line "META <version> <running> <waiting> <config key>", then the list.
 # rc 3 = 401 (a new token is needed). Bump ARGO_WF_CACHE_VER whenever the row
 # or URL format changes — an older cache is then ignored at start-up.
-ARGO_WF_CACHE_VER=5
+ARGO_WF_CACHE_VER=6
 _argo_wf_build() {
   local outfile="$1"
   local ns rows phase name age dur prog url total_running=0 total_waiting=0
@@ -1026,18 +1378,20 @@ _argo_wf_build() {
     while IFS=$'\t' read -r phase name age dur prog; do
       [[ -n "$name" ]] || continue
       note=""; kind="run"
+      local plan=""
       if [[ "$phase" == "Running" ]]; then
         _argo_prog "${CYAN}▸${NC}" "${name}: nodes …"
         _argo_wf_waiting "$ns" "$name"
         if [[ -n "$ARGO_WAIT" ]]; then
           kind="wait"; note="$ARGO_WAIT"; total_waiting=$((total_waiting + 1))
+          plan="$ARGO_WAIT_PLAN"
           _argo_prog "${YELLOW}⏸${NC}" "${name}: ${ARGO_WAIT}"
         fi
       elif [[ "$phase" == "Pending" ]]; then
         kind="pend"
       fi
       local rowurl="${url}/${name}"
-      [[ "$kind" == "wait" ]] && rowurl="__WAIT__ ${ns} ${name} ${ARGO_WAIT_BATCH:--} ${url}/${name} ${ARGO_WAIT_NODE}"
+      [[ "$kind" == "wait" ]] && rowurl="__WAIT__ ${ns} ${name} ${ARGO_WAIT_BATCH:--} ${url}/${name} ${plan:--} ${ARGO_WAIT_NODE}"
       recs+="${kind}${S}${ns}${S}${phase}${S}${name}${S}${age}${S}${dur}${S}${prog}${S}${note}${S}${rowurl}"$'\n'
       # under a waiting workflow: the Argo CD applications it is about to change
       if [[ "$kind" == "wait" ]] && argocd_enabled && ! _argocd_skipped "$ns"; then
@@ -1093,6 +1447,12 @@ _argo_wf_build() {
           recs+="cdok${S}${S}Synced${S}-${S}${S}${S}${S}Argo CD: apps (${sel}) synced${S}https://${ARGOCD_SERVER}/applications?labels=${selq}"$'\n'
         fi
       fi
+      # … and the Terraform plan it is about to apply
+      if [[ -n "$plan" ]]; then
+        _argo_prog "${CYAN}▸${NC}" "${name}: plan …"
+        _plan_recs "$ns" "$name" "$plan"
+        (( PLAN_UNITS > 0 )) && _argo_prog "${YELLOW}↳${NC}" "plan: ${PLAN_TOTAL}"
+      fi
     done <<< "$active"
   done
 
@@ -1102,7 +1462,7 @@ _argo_wf_build() {
   while IFS="$S" read -r kind ns phase name age dur prog note url; do
     [[ -n "$kind" ]] || continue
     (( ${#ns} > w_ns )) && w_ns=${#ns}
-    [[ "$kind" == "cdres" ]] && name="   ${name}"
+    [[ "$kind" == "cdres" || "$kind" == "tfunit" ]] && name="   ${name}"
     (( ${#name} > w_name )) && w_name=${#name}
   done <<< "$recs"
 
@@ -1120,7 +1480,7 @@ _argo_wf_build() {
   list+=$'\t'"$(printf '%b' "${CYAN}↻ Refresh${NC}")"$'\n'
   while IFS="$S" read -r kind ns phase name age dur prog note url; do
     [[ -n "$kind" ]] || continue
-    # a rule between workflows (not before the Argo CD sub-rows)
+    # a rule between workflows (not before the Argo CD / plan sub-rows)
     case "$kind" in
       run|wait|pend|idle|err) list+="$rule" ;;
     esac
@@ -1136,10 +1496,39 @@ _argo_wf_build() {
       cdlogin) icon="↳"; color="$YELLOW"; note="${YELLOW}${note}${NC}" ;;
       cderr)   icon="↳"; color="$RED";    note="${RED}${note}${NC}" ;;
       cdchg)   ;;   # phase = add/del/chg/key/more, rendered below
+      tfsum)   icon="↳"; color="$YELLOW"
+               [[ "$note" == *destroy && "$note" != *" 0 to destroy" ]] && color="$RED"
+               note="$(_plan_sum_color "$note")" ;;
+      tfunit)  icon=" "; color="$DIM";    name="   ${name}"; note="$(_plan_sum_color "$note")" ;;
+      tfok)    icon="↳"; color="$GREEN";  note="${DIM}${note}${NC}" ;;
+      tferr)   icon="↳"; color="$RED";    note="${RED}${note}${NC}" ;;
+      tfres|tfchg|tfmore) ;;   # free text, rendered below
       *)    icon="·"; color="$DIM";    phase="-"; name="-" ;;
     esac
     [[ "$kind" == "wait" ]] && note="${YELLOW}${note}${NC}"
     [[ "$kind" == "idle" ]] && note="${DIM}${note}${NC}"
+    if [[ "$kind" == tfres || "$kind" == tfchg || "$kind" == tfmore ]]; then
+      # plan text is data: nothing in it may act as an escape for printf %b
+      local tf_c="$DIM" tf_t
+      note="${note//\\/\\\\}"
+      case "$kind" in
+        tfres) case "$phase" in
+                 +)       tf_c="$GREEN" ;;
+                 "~")     tf_c="$YELLOW" ;;
+                 -)       tf_c="$RED" ;;
+                 -/+|+/-) tf_c='\033[1;31m' ;;
+               esac ;;
+        tfchg) tf_t="${note#"${note%%[! ]*}"}"
+               case "$tf_t" in
+                 "+ "*)             tf_c="$GREEN" ;;
+                 "~ "*)             tf_c="$YELLOW" ;;
+                 "- "*|-/+*|+/-*)   tf_c="$RED" ;;
+               esac ;;
+      esac
+      line=$(printf "%-${w_ns}s   %s %-9s   %s" "" " " "" "      ${tf_c}${note}${NC}")
+      list+="${url}"$'\t'"$(printf '%b' "$line")"$'\n'
+      continue
+    fi
     if [[ "$kind" == "cdchg" ]]; then
       # markers \x1c/\x1d … \x1e from _argocd_app_diff = exactly the changed
       # part: the whole old value red, the whole new value green (the key
@@ -1254,6 +1643,8 @@ argo_wf_status() {
   if [[ -f "$ARGO_WF_CACHE" ]] && head -1 "$ARGO_WF_CACHE" | grep -q "^META ${ARGO_WF_CACHE_VER} [0-9]* [0-9]* ${CACHE_KEY}\$"; then
     cp "$ARGO_WF_CACHE" "$tmp.next"; stale=1
   fi
+  # parsed plans of workflows long gone
+  find "$CACHE_DIR" -name 'plan-*' -type f -mtime +14 -exec rm -f {} + 2>/dev/null
   # leftovers of instances that died without cleanup (closed terminal)
   local f fpid
   for f in "${TMPDIR:-/tmp}"/argo-wf.*; do
@@ -1320,7 +1711,7 @@ NAV
       TIMER_PID=$!
     fi
     ui_select "$list" "argo" \
-      "$(printf '%b' "running: ${total_running} · waiting: ${total_waiting}${auto}${stale_note} · Enter = open / approve / refresh · Esc = quit")"
+      "$(printf '%b' "running: ${total_running} · waiting: ${total_waiting}${auto}${stale_note} · Enter = open / approve / plan / refresh · Esc = quit")"
     rc=$?
     _timer_stop
     (( rc == 0 )) || return 0
@@ -1340,7 +1731,11 @@ NAV
     if [[ "$url" == "__UPDATE__" ]]; then self_update ui; reuse=1; continue; fi
     if [[ "$url" == __WAIT__* ]]; then
       # shellcheck disable=SC2086
-      set -- $url; argo_wf_approve "$2" "$3" "$4" "$5" "${*:6}"; continue
+      set -- $url; argo_wf_approve "$2" "$3" "$4" "$5" "$6" "${*:7}"; continue
+    fi
+    if [[ "$url" == __PLAN__* ]]; then
+      # shellcheck disable=SC2086
+      set -- $url; argo_wf_plan "$2" "$3" "$4" "${5:-0}"; reuse=1; continue
     fi
     if [[ -z "$url" ]]; then cursor=0; continue; fi   # Refresh → a new table
     _open_url "$url"; reuse=1
@@ -1483,9 +1878,18 @@ Usage: ${0##*/} [options]
 Settings are remembered in the config file; every option also exists as an
 environment variable (ARGO_WF_SERVER, ARGO_WF_NAMESPACES, ARGOCD_SERVER, …).
 Tunables: ARGO_WF_REFRESH (s, 0 = off), ARGO_WF_LIMIT, ARGO_WF_PROD_BATCHES,
-ARGO_WF_INSECURE=1, ARGOCD_SELECTOR, ARGOCD_SKIP_NAMESPACES, ARGOCD_DIFF_LINES,
-ARGOCD_DIFF_IGNORE.
+ARGO_WF_INSECURE=1, ARGO_WF_PLAN_NODES, ARGO_WF_PLAN_LINES, ARGOCD_SELECTOR,
+ARGOCD_SKIP_NAMESPACES, ARGOCD_DIFF_LINES, ARGOCD_DIFF_IGNORE.
 EOF
+}
+
+# _fzf_at_least <major> <minor>
+_fzf_at_least() {
+  local v major minor
+  v=$(fzf --version 2>/dev/null | awk '{print $1}')
+  major="${v%%.*}"; minor="${v#*.}"; minor="${minor%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+  (( major > $1 || (major == $1 && minor >= $2) ))
 }
 
 check_deps() {
