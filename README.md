@@ -2,7 +2,7 @@
 
 A full-screen terminal dashboard for [Argo Workflows](https://argoproj.github.io/workflows/) — one bash file, no installation.
 
-It talks to the **argo-server REST API** with your SSO bearer token, so it works for clusters you cannot reach with `kubectl`. It shows what is running in the namespaces you care about, tells you which workflows are parked on a **suspend node** (an approval gate), lets you **approve them from the terminal**, and — if you point it at an [Argo CD](https://argo-cd.readthedocs.io/) server — shows **what exactly is out of sync** underneath, so you know what you are approving.
+It talks to the **argo-server REST API** with your SSO bearer token, so it works for clusters you cannot reach with `kubectl`. It shows what is running in the namespaces you care about, tells you which workflows are parked on a **suspend node** (an approval gate), lets you **approve them from the terminal**, and shows what you are approving: **what exactly is out of sync** in [Argo CD](https://argo-cd.readthedocs.io/) (if you point it at a server), or the **Terraform / OpenTofu plan** the workflow made.
 
 ```
 ╭─ Argo WF · argo.example.com ───────────────────────────────────────────────────────────── ↻ 1:42 ─╮
@@ -84,11 +84,12 @@ SSO sessions expire (10 hours by default). When the server starts answering `401
 
 | | |
 |---|---|
-| `↑` `↓` | move (separators and diff rows are skipped) |
+| `↑` `↓` | move (separators, diff rows and plan lines are skipped) |
 | type | filter the table |
 | `Enter` on a workflow | open it in the browser |
 | `Enter` on a **Waiting** workflow | approve it / open it |
 | `Enter` on an Argo CD row | open the application — or that resource's diff — in the Argo CD UI |
+| `Enter` on a plan row | the full plan — all of it, or the unit you are on |
 | `Enter` on `↻ Refresh` | reload now |
 | `Enter` on `⬆ Update argo-wf` | check for a newer version and install it |
 | `Esc` | back / quit |
@@ -104,7 +105,7 @@ PUT /api/v1/workflows/<namespace>/<name>/resume
 {"nodeFieldSelector": "displayName=<suspended node>,phase=Running"}
 ```
 
-so the server records you as the one who resumed it, and your usual RBAC applies. Before anything is sent the tool re-checks that the workflow still waits, and asks for confirmation.
+so the server records you as the one who resumed it, and your usual RBAC applies. Before anything is sent the tool re-checks that the workflow still waits, and asks for confirmation. When the workflow made a Terraform plan, the menu also offers **Show the plan** and the confirmation repeats its totals.
 
 **Batches.** If the suspended node was expanded from a loop over items that have a `batch` key — its node name then looks like `deploy(2:batch:prod,…)` — the batch name is shown (`waiting for approval: prod`) and used below. Batches listed in `ARGO_WF_PROD_BATCHES` (default `prod`) need a second confirmation: you have to type the batch name. A batch that is a path — `aws/prod/account-1` — counts as well when one of its `/`-separated segments is listed; you then type that segment (`prod`).
 
@@ -117,6 +118,30 @@ For every waiting workflow the tool looks up the Argo CD applications that belon
 - Keys in `ARGOCD_DIFF_IGNORE` (default `labels`) are removed from both sides before comparing — a chart version bump that only touches labels is noise. Applications that differ *only* there are treated as synced.
 - Diffs longer than `ARGOCD_DIFF_LINES` (default 5, headings not counted) collapse into `… N changes`; press Enter on the resource to see the full diff in the Argo CD UI.
 - Authentication is the `argocd` CLI's own: if you are not signed in, a row offers `argocd login <server> --sso`.
+
+## What is about to be applied (Terraform / OpenTofu)
+
+A workflow that runs Terraform usually parks on its approval gate right after a plan step. For every waiting workflow the tool finds that step and shows its plan underneath:
+
+```
+infra-net   ⏸ Waiting   release-4x7kp   12m ago   12m   21/22   waiting for approval: aws/prod/account-1
+            ↳ Plan      2 of 9 units                            3 to add, 1 to change, 1 to destroy
+                           network/vpc                          2 to add, 0 to change, 0 to destroy
+                              + aws_subnet.private["c"]
+                              + aws_route_table_association.private["c"]
+                           database/main                        1 to add, 1 to change, 1 to destroy
+                              -/+ aws_db_parameter_group.main  must be replaced
+                                  ~ family = "postgres15" -> "postgres16" # forces replacement
+                              ~ aws_db_instance.main
+                                  ~ engine_version = "15.7" -> "16.3"
+```
+
+Created and destroyed resources are listed by address; for the ones updated or replaced you also get the lines that change, at most `ARGO_WF_PLAN_LINES` each. Anything to destroy is red. **Enter** on a plan row opens the plan as it was printed — the whole of it on the `↳ Plan` row, one unit on a unit or resource row — in a panel where typing filters the lines (`destroy`, a resource name, …).
+
+- The plan step is a finished pod of the workflow whose name matches `ARGO_WF_PLAN_NODES` (shell patterns, default `*plan*`; `-` switches the feature off). When several match — one plan per batch — the one from the same loop item as the suspended node is taken.
+- The plan is read from that step's **archived log** (the `main-logs` artifact), so the server must archive logs (`archiveLogs: true`); the pod itself is usually gone by the time you approve. If the log holds no plan, nothing is shown.
+- Plain `terraform plan` / `tofu plan` output is understood, and so is [Terragrunt](https://terragrunt.gruntwork.io/)'s `run --all`, where each unit gets its own rows and the ones without changes are only counted.
+- A parsed plan is kept in `~/.cache/argo-wf/` (mode `600`, removed after two weeks) — a finished step's log does not change, so it is fetched once.
 
 ## Configuration
 
@@ -131,6 +156,8 @@ Everything lives in `~/.config/argo-wf/config` (mode `600`, plain `KEY="value"` 
 | `ARGO_WF_LIMIT` | `20` | newest N workflows fetched per namespace |
 | `ARGO_WF_PROD_BATCHES` | `prod` | batches that need the typed confirmation |
 | `ARGO_WF_INSECURE` | – | `1` = skip TLS verification (`curl -k`) |
+| `ARGO_WF_PLAN_NODES` | `*plan*` | steps (shell patterns) whose log holds a Terraform plan; `-` = off |
+| `ARGO_WF_PLAN_LINES` | `10` | changed lines listed per resource |
 | `ARGOCD_SERVER` | – | Argo CD host name; empty = feature off |
 | `ARGOCD_SELECTOR` | `app={namespace},batch={batch}` | label selector for a workflow's applications |
 | `ARGOCD_SKIP_NAMESPACES` | – | namespaces (shell patterns) without Argo CD applications |
