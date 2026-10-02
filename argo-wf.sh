@@ -21,7 +21,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 # ─── Colors & helpers ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -1166,9 +1166,119 @@ _plan_recs() {
   return 0
 }
 
+# _plan_html <ns> <workflow> <plan step> — the whole plan as one self-contained
+# HTML page (no scripts, nothing loaded from elsewhere), written next to the
+# parsed plan; its path lands in PLAN_HTML. One section per unit with changes
+# (id "u<unit number>", so a link can point at a unit), colors as in the
+# terminal, light or dark after the browser's setting.
+PLAN_HTML=""
+_plan_html() {
+  local ns="$1" wf="$2" step="$3" S=$'\x1f' um
+  PLAN_HTML=""
+  _plan_load "$ns" "$wf" "$step" || return 1
+  if (( PLAN_UNITS == 0 )); then PLAN_ERR="the log of that step holds no plan"; return 1; fi
+  um=$(umask); umask 077
+  awk -F"$S" -v ns="$ns" -v wf="$wf" -v at="${step#*@}" -v total="$PLAN_TOTAL" \
+      -v units="$PLAN_UNITS" -v ver="$VERSION" -v now="$(date '+%Y-%m-%d %H:%M')" '
+    function esc(t) { gsub(/&/, "\\&amp;", t); gsub(/</, "\\&lt;", t); gsub(/>/, "\\&gt;", t); return t }
+    # "2 to add, 1 to change, 0 to destroy", each part in its color
+    function sum(t,   n, i, part, c, out) {
+      n = split(t, part, /, /); out = ""
+      for (i = 1; i <= n; i++) {
+        c = ""
+        if (part[i] ~ /^0 to /) c = "m"
+        else if (part[i] ~ /add$/) c = "a"
+        else if (part[i] ~ /change$/) c = "c"
+        else if (part[i] ~ /destroy$/) c = "d"
+        out = out (i > 1 ? "<span class=\"m\">, </span>" : "") "<span class=\"" c "\">" esc(part[i]) "</span>"
+      }
+      return out
+    }
+    $1 == "U" {
+      u++; cur = 0
+      if ($3 == "nochange") { same[++nsame] = ($2 == "" ? "." : $2); next }
+      cur = u; ids[++nchg] = u; name[u] = ($2 == "" ? "Plan" : $2); summ[u] = $7
+      next
+    }
+    $1 == "L" && cur {
+      t = esc($2); s = $2; sub(/^ */, "", s); c = ""
+      gsub(/# forces replacement/, "<span class=\"d\">&</span>", t)
+      if (s ~ /^# /) c = (s ~ /destroyed|replaced/) ? "h d" : "h"
+      else if (s ~ /^(-\/\+|\+\/-) /) c = "d"
+      else if (s ~ /^\+ /) c = "a"
+      else if (s ~ /^- /)  c = "d"
+      else if (s ~ /^~ /)  c = "c"
+      else if (s ~ /^<= /) c = "r"
+      body[cur] = body[cur] (c == "" ? t : "<span class=\"" c "\">" t "</span>") "\n"
+    }
+    END {
+      print "<!doctype html>"
+      print "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+      print "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+      print "<title>Plan — " esc(wf) "</title>"
+      print "<style>"
+      print ":root{color-scheme:light dark;--bg:#fff;--fg:#1f2328;--m:#6e7781;--a:#1a7f37;--d:#cf222e;--c:#9a6700;--r:#0969da;--box:#f6f8fa;--line:#d0d7de}"
+      print "@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--m:#8b949e;--a:#3fb950;--d:#f85149;--c:#d29922;--r:#58a6ff;--box:#161b22;--line:#30363d}}"
+      print "body{margin:0 auto;padding:24px 16px;max-width:1200px;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",Helvetica,Arial,sans-serif}"
+      print "h1{font-size:20px;margin:0 0 4px;overflow-wrap:anywhere}h2{font-size:14px;margin:28px 0 8px;color:var(--m)}"
+      print ".meta{margin:0 0 20px;color:var(--m);overflow-wrap:anywhere}.total{font-size:16px;margin:0 0 20px}"
+      print "code,pre,summary b{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}"
+      print "ul{margin:0;padding:0;list-style:none}li{padding:2px 0;overflow-wrap:anywhere}a{color:inherit}"
+      print "details{margin:12px 0;border:1px solid var(--line);border-radius:6px}"
+      print "summary{padding:8px 12px;background:var(--box);border-radius:6px;cursor:pointer;overflow-wrap:anywhere}"
+      print "details[open] summary{border-bottom:1px solid var(--line);border-radius:6px 6px 0 0}"
+      print ".s{margin-left:12px}"
+      print "pre{margin:0;padding:12px;font-size:13px;line-height:1.45;overflow-x:auto}"
+      print ".a{color:var(--a)}.d{color:var(--d)}.c{color:var(--c)}.r{color:var(--r)}.m{color:var(--m)}.h{font-weight:600}"
+      print "footer{margin-top:28px;color:var(--m);font-size:12px}"
+      print "</style></head><body>"
+      print "<h1>Plan — " esc(wf) "</h1>"
+      print "<p class=\"meta\">" esc(ns) " / " esc(wf) (at == "" ? "" : " · planned " esc(at)) "</p>"
+      print "<p class=\"total\">" sum(total) (units > 1 ? " <span class=\"m\">· " nchg " of " units " units</span>" : "") "</p>"
+      if (nchg > 1) {
+        print "<ul>"
+        for (i = 1; i <= nchg; i++) {
+          u = ids[i]
+          print "<li><a href=\"#u" u "\"><code>" esc(name[u]) "</code></a> <span class=\"s\">" sum(summ[u]) "</span></li>"
+        }
+        print "</ul>"
+      }
+      for (i = 1; i <= nchg; i++) {
+        u = ids[i]
+        print "<details open id=\"u" u "\"><summary><b>" esc(name[u]) "</b><span class=\"s\">" sum(summ[u]) "</span></summary>"
+        printf "<pre>%s</pre></details>\n", body[u]
+      }
+      if (nsame) {
+        print "<h2>No changes in " nsame (nsame == 1 ? " unit" : " units") "</h2><ul class=\"m\">"
+        for (i = 1; i <= nsame; i++) print "<li><code>" esc(same[i]) "</code></li>"
+        print "</ul>"
+      }
+      print "<footer>argo-wf " esc(ver) " · written " esc(now) "</footer>"
+      print "</body></html>"
+    }' "$PLAN_FILE" > "${PLAN_FILE}.html.tmp.$$" && mv "${PLAN_FILE}.html.tmp.$$" "${PLAN_FILE}.html"
+  local rc=$?
+  umask "$um"
+  if (( rc != 0 )); then PLAN_ERR="the page could not be written"; return 1; fi
+  PLAN_HTML="${PLAN_FILE}.html"
+}
+
+# argo_wf_plan_open <ns> <workflow> <plan step> [unit number] — writes the
+# page and opens it in the browser, at the given unit if there is one.
+argo_wf_plan_open() {
+  if ! _plan_html "$1" "$2" "$3"; then
+    section "Plan — ${1}/${2}"
+    sline "${RED}✖${NC}" "No plan to open: ${PLAN_ERR}"
+    pause_close; return 1
+  fi
+  local url="file://${PLAN_HTML// /%20}"
+  (( ${4:-0} > 0 )) && url+="#u${4}"
+  _open_url "$url"
+}
+
 # argo_wf_plan <ns> <workflow> <plan step> [unit number] — the plan as it was
 # printed, in a panel: all units with changes, or just the given one. Typing
-# filters the lines ("destroy", a resource name, …).
+# filters the lines ("destroy", a resource name, …); Ctrl-O hands the whole
+# plan to the browser as a file.
 argo_wf_plan() {
   local ns="$1" wf="$2" node="$3" only="${4:-0}" S=$'\x1f' list
   if ! _plan_load "$ns" "$wf" "$node"; then
@@ -1213,11 +1323,18 @@ argo_wf_plan() {
     sline "${YELLOW}⚠${NC}" "The log of that step holds no plan."
     pause_close; return 0
   fi
-  UI_TITLE="Plan — ${wf}"
-  UI_EXTRA_OPTS=(--ansi --exact)
-  _fzf_at_least 0 54 && UI_EXTRA_OPTS+=(--wrap)
-  ui_select "$list" "filter" "${ns}/${wf} · ${PLAN_TOTAL} · type to filter the lines · Enter / Esc = back"
-  return 0
+  # once the page is written, the header says where (first, so that a long
+  # header is cut at the other end)
+  local head="${ns}/${wf} · ${PLAN_TOTAL}"
+  while true; do
+    UI_TITLE="Plan — ${wf}"
+    UI_EXTRA_OPTS=(--ansi --exact "--bind=ctrl-o:become(echo __OPEN__)")
+    _fzf_at_least 0 54 && UI_EXTRA_OPTS+=(--wrap)
+    ui_select "$list" "filter" \
+      "${head} · type to filter the lines · Ctrl-O = open in the browser · Enter / Esc = back" || return 0
+    [[ "$UI_RESULT" == "__OPEN__" ]] || return 0
+    argo_wf_plan_open "$ns" "$wf" "$node" "$only" && head="Opened in the browser, saved as ${PLAN_HTML/#$HOME/~}"
+  done
 }
 
 # ─── Approve from the terminal ───────────────────────────────────────
@@ -1233,13 +1350,18 @@ argo_wf_approve() {
   local items="✔  Approve ${what} (resume ${node})"
   if [[ -n "$plan" ]] && _plan_load "$ns" "$name" "$plan" && (( PLAN_UNITS > 0 )); then
     items+=$'\n'"≡  Show the plan (${PLAN_TOTAL})"
+    items+=$'\n'"↗  Open the plan in the browser"
   fi
-  items+=$'\n'"↗  Open in the browser"
+  items+=$'\n'"↗  Open the workflow in the browser"
+  local head="${ns}/${name} is waiting: ${what}"
   while true; do
     UI_TITLE="Argo WF — ${name}"
-    ui_select "$items" "wf" "${ns}/${name} is waiting: ${what} · Enter = select · Esc = back" || return 0
+    ui_select "$items" "wf" "${head} · Enter = select · Esc = back" || return 0
     case "$UI_RESULT" in
       "≡"*) argo_wf_plan "$ns" "$name" "$plan" ;;
+      "↗  Open the plan"*)
+            argo_wf_plan_open "$ns" "$name" "$plan" \
+              && head="Plan opened in the browser, saved as ${PLAN_HTML/#$HOME/~}" ;;
       "↗"*) _open_url "$url"; return 0 ;;
       "✔"*) break ;;
       *) return 0 ;;
@@ -1562,7 +1684,8 @@ _argo_wf_build() {
   # cache for an instant start next time (shown at once, refreshed behind it)
   if [[ -n "${ARGO_WF_CACHE:-}" ]]; then
     mkdir -p "$(dirname "$ARGO_WF_CACHE")" 2>/dev/null
-    cp "$outfile" "$ARGO_WF_CACHE" 2>/dev/null
+    # the table quotes plans and diffs: like them, not for other users
+    cp "$outfile" "$ARGO_WF_CACHE" 2>/dev/null && chmod 600 "$ARGO_WF_CACHE" 2>/dev/null
   fi
   rm -rf "$ARGO_PREFETCH_DIR" 2>/dev/null
   return 0
