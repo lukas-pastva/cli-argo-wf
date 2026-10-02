@@ -90,6 +90,7 @@ SSO sessions expire (10 hours by default). When the server starts answering `401
 | `Enter` on a **Waiting** workflow | approve it / open it |
 | `Enter` on an Argo CD row | open the application — or that resource's diff — in the Argo CD UI |
 | `Enter` on a plan row | the full plan — all of it, or the unit you are on |
+| `Ctrl-O` in the plan | write the whole plan to a file and open it in the browser |
 | `Enter` on `↻ Refresh` | reload now |
 | `Enter` on `⬆ Update argo-wf` | check for a newer version and install it |
 | `Esc` | back / quit |
@@ -105,7 +106,7 @@ PUT /api/v1/workflows/<namespace>/<name>/resume
 {"nodeFieldSelector": "displayName=<suspended node>,phase=Running"}
 ```
 
-so the server records you as the one who resumed it, and your usual RBAC applies. Before anything is sent the tool re-checks that the workflow still waits, and asks for confirmation. When the workflow made a Terraform plan, the menu also offers **Show the plan** and the confirmation repeats its totals.
+so the server records you as the one who resumed it, and your usual RBAC applies. Before anything is sent the tool re-checks that the workflow still waits, and asks for confirmation. When the workflow made a Terraform plan, the menu also offers **Show the plan** and **Open the plan in the browser**, and the confirmation repeats its totals.
 
 **Batches.** If the suspended node was expanded from a loop over items that have a `batch` key — its node name then looks like `deploy(2:batch:prod,…)` — the batch name is shown (`waiting for approval: prod`) and used below. Batches listed in `ARGO_WF_PROD_BATCHES` (default `prod`) need a second confirmation: you have to type the batch name. A batch that is a path — `aws/prod/account-1` — counts as well when one of its `/`-separated segments is listed; you then type that segment (`prod`).
 
@@ -138,10 +139,12 @@ infra-net   ⏸ Waiting   release-4x7kp   12m ago   12m   21/22   waiting for ap
 
 Created and destroyed resources are listed by address; for the ones updated or replaced you also get the lines that change, at most `ARGO_WF_PLAN_LINES` each. Anything to destroy is red. **Enter** on a plan row opens the plan as it was printed — the whole of it on the `↳ Plan` row, one unit on a unit or resource row — in a panel where typing filters the lines (`destroy`, a resource name, …).
 
+**In the browser.** `Ctrl-O` in that panel — or *Open the plan in the browser* in the approve menu — writes the whole plan into one HTML file and opens it: a list of the units with changes, each unit a collapsible section, the same colors, light or dark after your browser. The file is self-contained (no scripts, nothing loaded from the network) and lives next to the cached plan as `~/.cache/argo-wf/plan-….html`; the panel tells you its name.
+
 - The plan step is a finished pod of the workflow whose name matches `ARGO_WF_PLAN_NODES` (shell patterns, default `*plan*`; `-` switches the feature off). When several match — one plan per batch — the one from the same loop item as the suspended node is taken.
 - The plan is read from that step's **archived log** (the `main-logs` artifact), so the server must archive logs (`archiveLogs: true`); the pod itself is usually gone by the time you approve. If the log holds no plan, nothing is shown.
 - Plain `terraform plan` / `tofu plan` output is understood, and so is [Terragrunt](https://terragrunt.gruntwork.io/)'s `run --all`, where each unit gets its own rows and the ones without changes are only counted.
-- A parsed plan is kept in `~/.cache/argo-wf/` (mode `600`, removed after two weeks) — a finished step's log does not change, so it is fetched once.
+- A parsed plan — and its HTML page, once you asked for one — is kept in `~/.cache/argo-wf/` (mode `600`, removed after two weeks) — a finished step's log does not change, so it is fetched once.
 
 ## Configuration
 
