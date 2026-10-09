@@ -21,7 +21,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 
 # ─── Colors & helpers ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -359,12 +359,15 @@ CONFIG_FILE="${ARGO_WF_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/argo-wf/config}
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/argo-wf"
 CONFIG_VARS="ARGO_WF_SERVER ARGO_WF_NAMESPACES ARGO_WF_LIMIT ARGO_WF_REFRESH ARGO_WF_IDLE
              ARGO_WF_PROD_BATCHES ARGO_WF_INSECURE ARGO_WF_PLAN_NODES ARGO_WF_PLAN_LINES
+             ARGO_WF_AUTHOR_PARAMS ARGO_WF_ME
              ARGOCD_SERVER ARGOCD_SELECTOR
              ARGOCD_SKIP_NAMESPACES ARGOCD_FLAGS ARGOCD_DIFF_LINES ARGOCD_DIFF_IGNORE"
 
 NAMESPACES=()
 ARGOCD_SKIP=()
 PLAN_PATTERNS=()
+AUTHOR_PARAMS=""
+ME_NAMES=""
 ARGO_TOKEN_ALT=""
 CURL_OPTS=()
 
@@ -416,6 +419,10 @@ config_apply() {
   : "${ARGO_WF_PROD_BATCHES:=prod}" # batches that need a typed confirmation
   : "${ARGO_WF_PLAN_NODES:=*plan*}" # steps whose log holds a Terraform plan, "-" = off
   : "${ARGO_WF_PLAN_LINES:=10}"     # changed lines listed per resource
+  # workflow parameters that name the person behind a run, in order of
+  # preference (when the creator labels only name a service account)
+  : "${ARGO_WF_AUTHOR_PARAMS:=PRMergedBy ghaActor author actor}"
+  : "${ARGO_WF_ME:=}"               # your other names (a GitHub login, say)
   # (not ${VAR:=…}: the first "}" of the placeholders would end the expansion)
   [[ -n "$ARGOCD_SELECTOR" ]] || ARGOCD_SELECTOR='app={namespace},batch={batch}'
   : "${ARGOCD_FLAGS:=--grpc-web}"
@@ -438,7 +445,27 @@ config_apply() {
   set +f
   CURL_OPTS=()
   [[ "${ARGO_WF_INSECURE:-}" == "1" ]] && CURL_OPTS=(-k)
-  CACHE_KEY=$(printf '%s' "${VERSION}|${ARGO_WF_SERVER}|${NAMESPACES[*]:-}|${ARGOCD_SERVER}|${ARGOCD_SELECTOR}|${ARGOCD_SKIP_NAMESPACES}|${ARGO_WF_PLAN_NODES}|${ARGO_WF_PLAN_LINES}" | cksum | awk '{print $1}')
+  AUTHOR_PARAMS="${ARGO_WF_AUTHOR_PARAMS//,/ }"
+  ME_NAMES="${ARGO_WF_ME//,/ }"
+  CACHE_KEY=$(printf '%s' "${VERSION}|${ARGO_WF_SERVER}|${NAMESPACES[*]:-}|${ARGOCD_SERVER}|${ARGOCD_SELECTOR}|${ARGOCD_SKIP_NAMESPACES}|${ARGO_WF_PLAN_NODES}|${ARGO_WF_PLAN_LINES}|${AUTHOR_PARAMS}|${ME_NAMES}" | cksum | awk '{print $1}')
+}
+
+# _is_me <name> — 0 when a name from a workflow is you: the e-mail you are
+# signed in with, one of the names in ARGO_WF_ME, or a login that is your
+# e-mail's local part with the dots and dashes taken out (jane-doe ~
+# jane.doe@example.com). Letter case does not matter.
+_is_me() {
+  local n me x
+  n=$(tr '[:upper:]' '[:lower:]' <<< "$1")
+  [[ -n "$n" ]] || return 1
+  for x in $ME_NAMES; do
+    [[ "$n" == "$(tr '[:upper:]' '[:lower:]' <<< "$x")" ]] && return 0
+  done
+  me=$(tr '[:upper:]' '[:lower:]' <<< "${ARGO_WHO:-}")
+  [[ -n "$me" && "$me" != "?" ]] || return 1
+  [[ "$n" == "$me" ]] && return 0
+  me="${me%%@*}"; me="${me//[.-]/}"; n="${n//[.-]/}"
+  [[ -n "$me" && "$n" == "$me" ]]
 }
 
 # First run / --setup: three short prompts, all optional to change.
@@ -610,11 +637,38 @@ argo_wf_ensure_token() {
   done
 }
 
+# Who is behind a workflow (jq, shared by the list and the approval screen).
+# author: the creator labels the server sets on a submit (creator-email, the
+# "@" comes back as ".at.", creator-preferred-username, creator — unless that
+# is a service account: then an Argo Events sensor or the like created it and
+# the person is in a parameter named in ARGO_WF_AUTHOR_PARAMS, e.g. the
+# GitHub login that merged the pull request). actor: the last person who
+# resumed / stopped / retried it, with the action ("resume by jane@…").
+JQ_WHO='
+  def unat: if . == null then null else sub("\\.at\\."; "@") end;
+  def who($l; $p):
+    ( $l["workflows.argoproj.io/\($p)-email"] | unat )
+    // $l["workflows.argoproj.io/\($p)-preferred-username"]
+    // ( $l["workflows.argoproj.io/\($p)"]
+         | select(. != null and (startswith("system-serviceaccount-") | not)) );
+  def author($w; $params):
+    who($w.metadata.labels // {}; "creator")
+    // ( [ $params[] as $n
+          | ($w.spec.arguments.parameters // [])[]
+          | select(.name == $n and ((.value // "") | tostring) != "")
+          | (.value | tostring) ] | .[0] )
+    // "";
+  def actor($w):
+    ($w.metadata.labels // {}) as $l
+    | (who($l; "actor") // "") as $a
+    | if $a == "" then ""
+      else "\(($l["workflows.argoproj.io/action"] // "touched") | ascii_downcase) by \($a)" end;'
+
 # _argo_ns_rows <namespace> — TSV rows in ARGO_ROWS: phase, name, age,
-# duration, progress (the server returns newest first; the API cannot filter
-# by phase, so that happens later in _argo_wf_build).
+# duration, progress, author, last actor (the server returns newest first;
+# the API cannot filter by phase, so that happens later in _argo_wf_build).
 ARGO_ROWS=""
-ARGO_LIST_FIELDS="items.metadata.name,items.metadata.creationTimestamp,items.status.phase,items.status.startedAt,items.status.finishedAt,items.status.progress"
+ARGO_LIST_FIELDS="items.metadata.name,items.metadata.creationTimestamp,items.metadata.labels,items.spec.arguments.parameters,items.status.phase,items.status.startedAt,items.status.finishedAt,items.status.progress"
 _argo_ns_rows() {
   ARGO_ROWS=""
   if [[ -n "$ARGO_PREFETCH_DIR" && -f "${ARGO_PREFETCH_DIR}/${1}.code" ]]; then
@@ -624,19 +678,21 @@ _argo_ns_rows() {
   else
     _argo_api "/api/v1/workflows/${1}?listOptions.limit=${ARGO_WF_LIMIT}&fields=${ARGO_LIST_FIELDS}" || return 1
   fi
-  ARGO_ROWS=$(jq -r '
+  ARGO_ROWS=$(jq -r --arg params "$AUTHOR_PARAMS" "$JQ_WHO"'
     def hum: if . < 60 then "\(.)s"
              elif . < 3600 then "\(./60|floor)m"
              elif . < 86400 then "\(./3600|floor)h \((. % 3600)/60|floor)m"
              else "\(./86400|floor)d \((. % 86400)/3600|floor)h" end;
     now as $now
+    | ($params | split(" ") | map(select(. != ""))) as $pn
     | (.items // [])[]
     | ((.status.startedAt // .metadata.creationTimestamp) | fromdateiso8601) as $s
     | (if .status.finishedAt then (.status.finishedAt | fromdateiso8601) else $now end) as $f
     | [ (.status.phase // "Pending"), .metadata.name,
         (($now - $s) | if . < 0 then 0 else . end | floor | hum),
         (($f - $s) | if . < 0 then 0 else . end | floor | hum),
-        (.status.progress // "") ]
+        (.status.progress // ""),
+        author(.; $pn), actor(.) ]
     | @tsv' <<< "$ARGO_BODY")
 }
 
@@ -650,13 +706,21 @@ _argo_ns_rows() {
 # name matches ARGO_WF_PLAN_NODES. Among several the one whose node name
 # shares the longest prefix with the suspended node wins (the same loop item
 # — the same batch), then the one that finished last.
+# ARGO_WAIT_BY / ARGO_WAIT_ACTOR = the person behind the workflow and the
+# last action on it (see JQ_WHO), fresh from the same request.
 ARGO_WAIT=""
 ARGO_WAIT_BATCH=""
 ARGO_WAIT_NODE=""
 ARGO_WAIT_PLAN=""
+ARGO_WAIT_BY=""
+ARGO_WAIT_ACTOR=""
 _argo_wf_waiting() {
   ARGO_WAIT=""; ARGO_WAIT_BATCH=""; ARGO_WAIT_NODE=""; ARGO_WAIT_PLAN=""
-  _argo_api "/api/v1/workflows/${1}/${2}?fields=status.nodes" || return 0
+  ARGO_WAIT_BY=""; ARGO_WAIT_ACTOR=""
+  _argo_api "/api/v1/workflows/${1}/${2}?fields=status.nodes,metadata.labels,spec.arguments.parameters" || return 0
+  IFS=$'\t' read -r ARGO_WAIT_BY ARGO_WAIT_ACTOR < <(jq -r --arg params "$AUTHOR_PARAMS" "$JQ_WHO"'
+    ($params | split(" ") | map(select(. != ""))) as $pn
+    | [ author(.; $pn), actor(.) ] | @tsv' <<< "$ARGO_BODY" 2>/dev/null)
   local line tag display batch parts=""
   while IFS=$'\t' read -r tag display batch; do
     [[ -n "$display" ]] || continue
@@ -1110,37 +1174,37 @@ _plan_sum_color() {
 _plan_recs() {
   local ns="$1" wf="$2" node="$3" key="__PLAN__ $1 $2 $3" S=$'\x1f'
   if ! _plan_load "$ns" "$wf" "$node"; then
-    recs+="tferr${S}${S}Plan${S}-${S}${S}${S}${S}${PLAN_ERR}${S}"$'\n'
+    recs+="tferr${S}${S}Plan${S}-${S}${S}${S}${S}${PLAN_ERR}${S}${S}"$'\n'
     return 0
   fi
   (( PLAN_UNITS > 0 )) || return 0
   local units="${PLAN_UNITS} units"; (( PLAN_UNITS == 1 )) && units="1 unit"
   if (( PLAN_CHANGED == 0 )); then
-    recs+="tfok${S}${S}Plan${S}-${S}${S}${S}${S}no changes (${units})${S}${key}"$'\n'
+    recs+="tfok${S}${S}Plan${S}-${S}${S}${S}${S}no changes (${units})${S}${S}${key}"$'\n'
     return 0
   fi
   local what="-"
   (( PLAN_UNITS > 1 )) && what="${PLAN_CHANGED} of ${units}"
-  recs+="tfsum${S}${S}Plan${S}${what}${S}${S}${S}${S}${PLAN_TOTAL}${S}${key}"$'\n'
+  recs+="tfsum${S}${S}Plan${S}${what}${S}${S}${S}${S}${PLAN_TOTAL}${S}${S}${key}"$'\n'
   local t f2 f3 f4 f5 f6 f7 ui=0 show=0 nres=0 nattr=0 more_res=0 more_attr=0
   while IFS="$S" read -r t f2 f3 f4 f5 f6 f7; do
     case "$t" in
       U|R)
         if (( more_attr > 0 )); then
-          recs+="tfmore${S}${S}${S}${S}${S}${S}${S}    … ${more_attr} more lines${S}__SKIP__"$'\n'
+          recs+="tfmore${S}${S}${S}${S}${S}${S}${S}    … ${more_attr} more lines${S}${S}__SKIP__"$'\n'
         fi
         nattr=0; more_attr=0 ;;
     esac
     case "$t" in
       U)
         if (( more_res > 0 )); then
-          recs+="tfmore${S}${S}${S}${S}${S}${S}${S}… ${more_res} more resources${S}__SKIP__"$'\n'
+          recs+="tfmore${S}${S}${S}${S}${S}${S}${S}… ${more_res} more resources${S}${S}__SKIP__"$'\n'
         fi
         ui=$((ui + 1)); nres=0; more_res=0; show=0
         [[ "$f3" == "nochange" ]] && continue
         show=1
         if (( PLAN_UNITS > 1 )) || [[ -n "$f2" ]]; then
-          recs+="tfunit${S}${S}${S}${f2:-.}${S}${S}${S}${S}${f7}${S}${key} ${ui}"$'\n'
+          recs+="tfunit${S}${S}${S}${f2:-.}${S}${S}${S}${S}${f7}${S}${S}${key} ${ui}"$'\n'
         fi ;;
       R)
         (( show )) || continue
@@ -1149,19 +1213,19 @@ _plan_recs() {
         show=1
         # what happens is spelled out only where the symbol does not say it all
         case "$f2" in +|-|"~") f4="" ;; esac
-        recs+="tfres${S}${S}${f2}${S}${S}${S}${S}${S}${f2:-→} ${f3}${f4:+  ${f4}}${S}${key} ${ui}"$'\n' ;;
+        recs+="tfres${S}${S}${f2}${S}${S}${S}${S}${S}${f2:-→} ${f3}${f4:+  ${f4}}${S}${S}${key} ${ui}"$'\n' ;;
       A)
         (( show == 1 )) || continue
         nattr=$((nattr + 1))
         if (( nattr > ARGO_WF_PLAN_LINES )); then more_attr=$((more_attr + 1)); continue; fi
-        recs+="tfchg${S}${S}${S}${S}${S}${S}${S}    ${f2}${S}__SKIP__"$'\n' ;;
+        recs+="tfchg${S}${S}${S}${S}${S}${S}${S}    ${f2}${S}${S}__SKIP__"$'\n' ;;
     esac
   done < "$PLAN_FILE"
   if (( more_attr > 0 )); then
-    recs+="tfmore${S}${S}${S}${S}${S}${S}${S}    … ${more_attr} more lines${S}__SKIP__"$'\n'
+    recs+="tfmore${S}${S}${S}${S}${S}${S}${S}    … ${more_attr} more lines${S}${S}__SKIP__"$'\n'
   fi
   if (( more_res > 0 )); then
-    recs+="tfmore${S}${S}${S}${S}${S}${S}${S}… ${more_res} more resources${S}__SKIP__"$'\n'
+    recs+="tfmore${S}${S}${S}${S}${S}${S}${S}… ${more_res} more resources${S}${S}__SKIP__"$'\n'
   fi
   return 0
 }
@@ -1353,7 +1417,15 @@ argo_wf_approve() {
     items+=$'\n'"↗  Open the plan in the browser"
   fi
   items+=$'\n'"↗  Open the workflow in the browser"
-  local head="${ns}/${name} is waiting: ${what}"
+  # whose workflow this is (fresh — the row may be minutes old)
+  _argo_wf_waiting "$ns" "$name"
+  local who=""
+  if [[ -n "$ARGO_WAIT_BY" ]]; then
+    if _is_me "$ARGO_WAIT_BY"; then who="yours (${ARGO_WAIT_BY})"
+    else who="by ${ARGO_WAIT_BY} — not yours"; fi
+  fi
+  [[ -n "$ARGO_WAIT_ACTOR" ]] && who+="${who:+ · }last ${ARGO_WAIT_ACTOR}"
+  local head="${ns}/${name} is waiting: ${what}${who:+ · ${who}}"
   while true; do
     UI_TITLE="Argo WF — ${name}"
     ui_select "$items" "wf" "${head} · Enter = select · Esc = back" || return 0
@@ -1380,10 +1452,26 @@ argo_wf_approve() {
   if [[ -n "$ARGO_WAIT_PLAN" ]] && _plan_load "$ns" "$name" "$ARGO_WAIT_PLAN" && (( PLAN_UNITS > 0 )); then
     plan_note=" · plan: ${PLAN_TOTAL}"
   fi
+  # whose workflow you are about to approve — first in the header (a long
+  # header is cut on the right) and in the title when it is not yours
+  local yes="✔  Yes, approve ${what}"
+  who=""
   UI_TITLE="Approval — ${name}"
+  if [[ -n "$ARGO_WAIT_BY" ]]; then
+    if _is_me "$ARGO_WAIT_BY"; then
+      who="your workflow (${ARGO_WAIT_BY})"
+    else
+      who="⚠ NOT YOURS — by ${ARGO_WAIT_BY}"
+      yes="✔  Yes, approve ${what} for ${ARGO_WAIT_BY}"
+      UI_TITLE="Approval — ${name} — by ${ARGO_WAIT_BY}"
+    fi
+  else
+    who="nobody is named on this workflow"
+  fi
+  [[ -n "$ARGO_WAIT_ACTOR" ]] && who+=" · last ${ARGO_WAIT_ACTOR}"
   ui_select "✖  No, go back
-✔  Yes, approve ${what}" "confirm" \
-    "PUT /api/v1/workflows/${ns}/${name}/resume (${n})${plan_note} · Enter = select · Esc = back" || return 0
+${yes}" "confirm" \
+    "${who} · PUT /api/v1/workflows/${ns}/${name}/resume (${n})${plan_note} · Enter = select · Esc = back" || return 0
   [[ "$UI_RESULT" == "✔"* ]] || return 0
   # production batches (ARGO_WF_PROD_BATCHES) need the batch name typed out;
   # a batch that is a path counts when one of its segments is listed
@@ -1445,7 +1533,7 @@ _argo_ns_prefetch() {
 _argo_flush_diff() {
   if (( dcount == 0 )); then return; fi
   if (( dcount > ARGOCD_DIFF_LINES )); then
-    recs+="cdchg${S}${S}more${S}${S}${S}${S}${S}… ${dcount} changes${S}__SKIP__"$'\n'
+    recs+="cdchg${S}${S}more${S}${S}${S}${S}${S}… ${dcount} changes${S}${S}__SKIP__"$'\n'
   else
     recs+="$dbuf"
   fi
@@ -1456,7 +1544,7 @@ _argo_flush_diff() {
 # line "META <version> <running> <waiting> <config key>", then the list.
 # rc 3 = 401 (a new token is needed). Bump ARGO_WF_CACHE_VER whenever the row
 # or URL format changes — an older cache is then ignored at start-up.
-ARGO_WF_CACHE_VER=6
+ARGO_WF_CACHE_VER=7
 _argo_wf_build() {
   local outfile="$1"
   local ns rows phase name age dur prog url total_running=0 total_waiting=0
@@ -1468,24 +1556,25 @@ _argo_wf_build() {
     if ! _argo_ns_rows "$ns"; then
       if [[ "$ARGO_HTTP_CODE" == "401" ]]; then rm -rf "$ARGO_PREFETCH_DIR" 2>/dev/null; return 3; fi
       _argo_prog "${RED}✖${NC}" "${ns}: HTTP ${ARGO_HTTP_CODE}"
-      recs+="err${S}${ns}${S}${S}${S}${S}${S}${S}HTTP ${ARGO_HTTP_CODE}${S}${url}"$'\n'
+      recs+="err${S}${ns}${S}${S}${S}${S}${S}${S}HTTP ${ARGO_HTTP_CODE}${S}${S}${url}"$'\n'
       continue
     fi
     rows="$ARGO_ROWS"
-    local running=0 last="" active=""
-    while IFS=$'\t' read -r phase name age dur prog; do
+    local running=0 last="" active="" by actor
+    while IFS=$'\t' read -r phase name age dur prog by actor; do
       [[ -n "$name" ]] || continue
       case "$phase" in
         Running|Pending)
           running=$((running + 1))
-          active+="${phase}"$'\t'"${name}"$'\t'"${age}"$'\t'"${dur}"$'\t'"${prog}"$'\n' ;;
+          active+="${phase}"$'\t'"${name}"$'\t'"${age}"$'\t'"${dur}"$'\t'"${prog}"$'\t'"${by}"$'\t'"${actor}"$'\n' ;;
         *)
           [[ -n "$last" ]] && continue
           case "$phase" in
             Succeeded)    last="${GREEN}✔${NC} ${age} ago" ;;
             Failed|Error) last="${RED}✖ ${phase}${NC} ${age} ago" ;;
             *)            last="${phase} ${age} ago" ;;
-          esac ;;
+          esac
+          [[ -n "$by" ]] && last+=" by ${by}" ;;
       esac
     done <<< "$rows"
     total_running=$((total_running + running))
@@ -1494,10 +1583,10 @@ _argo_wf_build() {
     if (( running == 0 )); then
       if [[ -z "$rows" ]]; then note="no workflows"
       else note="nothing running${last:+ · last ${last}}"; fi
-      recs+="idle${S}${ns}${S}${S}${S}${S}${S}${S}${note}${S}${url}"$'\n'
+      recs+="idle${S}${ns}${S}${S}${S}${S}${S}${S}${note}${S}${S}${url}"$'\n'
       continue
     fi
-    while IFS=$'\t' read -r phase name age dur prog; do
+    while IFS=$'\t' read -r phase name age dur prog by actor; do
       [[ -n "$name" ]] || continue
       note=""; kind="run"
       local plan=""
@@ -1507,14 +1596,16 @@ _argo_wf_build() {
         if [[ -n "$ARGO_WAIT" ]]; then
           kind="wait"; note="$ARGO_WAIT"; total_waiting=$((total_waiting + 1))
           plan="$ARGO_WAIT_PLAN"
-          _argo_prog "${YELLOW}⏸${NC}" "${name}: ${ARGO_WAIT}"
+          # who approved the earlier gates (or stopped / retried it)
+          [[ -n "$actor" ]] && note+=" · last ${actor}"
+          _argo_prog "${YELLOW}⏸${NC}" "${name}: ${ARGO_WAIT}${by:+ · by ${by}}"
         fi
       elif [[ "$phase" == "Pending" ]]; then
         kind="pend"
       fi
       local rowurl="${url}/${name}"
       [[ "$kind" == "wait" ]] && rowurl="__WAIT__ ${ns} ${name} ${ARGO_WAIT_BATCH:--} ${url}/${name} ${plan:--} ${ARGO_WAIT_NODE}"
-      recs+="${kind}${S}${ns}${S}${phase}${S}${name}${S}${age}${S}${dur}${S}${prog}${S}${note}${S}${rowurl}"$'\n'
+      recs+="${kind}${S}${ns}${S}${phase}${S}${name}${S}${age}${S}${dur}${S}${prog}${S}${note}${S}${by}${S}${rowurl}"$'\n'
       # under a waiting workflow: the Argo CD applications it is about to change
       if [[ "$kind" == "wait" ]] && argocd_enabled && ! _argocd_skipped "$ns"; then
         local batch="$ARGO_WAIT_BATCH" sel cdk cda cdb cdc cdd cd_real=0
@@ -1529,10 +1620,10 @@ _argo_wf_build() {
               _argo_prog "${CYAN}▸${NC}" "Argo CD diff: ${cda} …"
               _argocd_app_diff "$cda" "$cdd"; drc=$?
               if (( drc == 2 )); then
-                recs+="cdlogin${S}${S}Argo CD${S}-${S}${S}${S}${S}not signed in · Enter = argocd login --sso${S}__ARGOCD_LOGIN__"$'\n'
+                recs+="cdlogin${S}${S}Argo CD${S}-${S}${S}${S}${S}not signed in · Enter = argocd login --sso${S}${S}__ARGOCD_LOGIN__"$'\n'
                 continue
               elif (( drc != 0 )); then
-                recs+="cdapp${S}${S}OutOfSync${S}${cda}${S}${S}${S}${S}${cdb} out of sync · ${ARGOCD_ERR}${S}${cdc}"$'\n'
+                recs+="cdapp${S}${S}OutOfSync${S}${cda}${S}${S}${S}${S}${cdb} out of sync · ${ARGOCD_ERR}${S}${S}${cdc}"$'\n'
                 continue
               fi
               nreal=$(grep -c "^res${S}" <<< "$ARGOCD_DIFF")
@@ -1540,7 +1631,7 @@ _argo_wf_build() {
               (( nreal == 0 )) && continue
               cd_real=$((cd_real + 1))
               _argo_prog "${RED}↳${NC}" "${cda}: ${nreal} changed"
-              recs+="cdapp${S}${S}OutOfSync${S}${cda}${S}${S}${S}${S}${nreal} changed${S}${cdc}"$'\n'
+              recs+="cdapp${S}${S}OutOfSync${S}${cda}${S}${S}${S}${S}${nreal} changed${S}${S}${cdc}"$'\n'
               # res<S>Kind/name<S>ns<S>group  |  chg<S>Kind/name<S>ns<S>group<S>add|del|chg|key<S>text
               # Diff rows cannot be selected (key __SKIP__, the arrows skip them).
               local dbuf="" dcount=0
@@ -1552,21 +1643,21 @@ _argo_wf_build() {
                   # (node=argoproj.io/Application/<ns>/<app>/0 + tab=diff);
                   # resource=kind:<Kind> narrows the tree to that kind
                   dkey="${cdc}?resource=kind%3A${dname%%/*}&node=$(printf '%s' "argoproj.io/Application/${cdd}/${cda}/0" | sed 's|/|%2F|g')&tab=diff"
-                  recs+="cdres${S}${S}${S}${dname}${S}${S}${S}${S}${dns}${S}${dkey}"$'\n'
+                  recs+="cdres${S}${S}${S}${dname}${S}${S}${S}${S}${dns}${S}${S}${dkey}"$'\n'
                   continue
                 fi
                 [[ "$dtype" == "key" ]] || dcount=$((dcount + 1))
-                dbuf+="cdchg${S}${S}${dtype}${S}${S}${S}${S}${S}${dtext}${S}__SKIP__"$'\n'
+                dbuf+="cdchg${S}${S}${dtype}${S}${S}${S}${S}${S}${dtext}${S}${S}__SKIP__"$'\n'
               done <<< "$ARGOCD_DIFF"
               _argo_flush_diff ;;
-            cdlogin) recs+="cdlogin${S}${S}Argo CD${S}-${S}${S}${S}${S}not signed in · Enter = argocd login --sso${S}__ARGOCD_LOGIN__"$'\n' ;;
-            cderr)   recs+="cderr${S}${S}Argo CD${S}-${S}${S}${S}${S}${cda}${S}"$'\n' ;;
+            cdlogin) recs+="cdlogin${S}${S}Argo CD${S}-${S}${S}${S}${S}not signed in · Enter = argocd login --sso${S}${S}__ARGOCD_LOGIN__"$'\n' ;;
+            cderr)   recs+="cderr${S}${S}Argo CD${S}-${S}${S}${S}${S}${cda}${S}${S}"$'\n' ;;
           esac
         done <<< "$ARGOCD_ROWS"
         # nothing with real changes (all synced, or labels only) → one row
         if (( cd_real == 0 )) && [[ "$ARGOCD_ROWS" != cdlogin* && "$ARGOCD_ROWS" != cderr* ]]; then
           local selq="${sel//=/%3D}"; selq="${selq//,/%2C}"
-          recs+="cdok${S}${S}Synced${S}-${S}${S}${S}${S}Argo CD: apps (${sel}) synced${S}https://${ARGOCD_SERVER}/applications?labels=${selq}"$'\n'
+          recs+="cdok${S}${S}Synced${S}-${S}${S}${S}${S}Argo CD: apps (${sel}) synced${S}${S}https://${ARGOCD_SERVER}/applications?labels=${selq}"$'\n'
         fi
       fi
       # … and the Terraform plan it is about to apply
@@ -1580,16 +1671,27 @@ _argo_wf_build() {
 
   # Step 2: column widths (only ASCII fields are padded — bash printf counts
   # bytes, so the icon/color stay outside the padded text) and rendering.
+  # The BY column (who is behind the workflow) only exists when someone is
+  # known; w_by = 0 leaves it out altogether.
+  local by w_by=0 by_pad by_c
   w_ns=9; w_name=8
-  while IFS="$S" read -r kind ns phase name age dur prog note url; do
+  while IFS="$S" read -r kind ns phase name age dur prog note by url; do
     [[ -n "$kind" ]] || continue
     (( ${#ns} > w_ns )) && w_ns=${#ns}
     [[ "$kind" == "cdres" || "$kind" == "tfunit" ]] && name="   ${name}"
     (( ${#name} > w_name )) && w_name=${#name}
+    (( ${#by} > w_by )) && w_by=${#by}
   done <<< "$recs"
+  (( w_by > 0 && w_by < 2 )) && w_by=2
 
+  # (BY is padded by hand so that its color can wrap the padded text: %s)
   local fmt="%-${w_ns}s   %s %-9s   %-${w_name}s   %-11s  %-8s  %-6s  %s"
-  list=$'\t'"$(printf '%b' "${DIM}$(printf "$fmt" "NAMESPACE" " " "STATE" "WORKFLOW" "STARTED" "DURATION" "PROG" "NOTE")${NC}")"$'\n'
+  by_pad=""
+  if (( w_by > 0 )); then
+    fmt="%-${w_ns}s   %s %-9s   %-${w_name}s   %s   %-11s  %-8s  %-6s  %s"
+    printf -v by_pad "%-${w_by}s" "BY"
+  fi
+  list=$'\t'"$(printf '%b' "${DIM}$(printf "$fmt" "NAMESPACE" " " "STATE" "WORKFLOW" ${by_pad:+"$by_pad"} "STARTED" "DURATION" "PROG" "NOTE")${NC}")"$'\n'
   # rules across the whole panel (border + pointer = ~6 columns); inside
   # $(...) stdout is not a tty, so the size comes from stty on /dev/tty
   local rule rule_w
@@ -1600,7 +1702,7 @@ _argo_wf_build() {
   rule="__RULE__"$'\t'"$(printf '%b' "${DIM}$(printf '─%.0s' $(seq 1 "$rule_w"))${NC}")"$'\n'
   list+="$rule"
   list+=$'\t'"$(printf '%b' "${CYAN}↻ Refresh${NC}")"$'\n'
-  while IFS="$S" read -r kind ns phase name age dur prog note url; do
+  while IFS="$S" read -r kind ns phase name age dur prog note by url; do
     [[ -n "$kind" ]] || continue
     # a rule between workflows (not before the Argo CD / plan sub-rows)
     case "$kind" in
@@ -1671,7 +1773,20 @@ _argo_wf_build() {
       list+="${url}"$'\t'"$(printf '%b' "$line")"$'\n'
       continue
     fi
-    line=$(printf "$fmt" "$ns" "${color}${icon}${NC}" "$phase" "$name" "${age:+${age} ago}" "$dur" "$prog" "$note")
+    if (( w_by > 0 )); then
+      # BY: you in green, anyone else on a workflow waiting for approval in
+      # yellow — the one to look at before pressing Enter
+      printf -v by_pad "%-${w_by}s" "$by"
+      by_c="$DIM"
+      if [[ -n "$by" ]]; then
+        if _is_me "$by"; then by_c="$GREEN"
+        elif [[ "$kind" == "wait" ]]; then by_c="$YELLOW"
+        else by_c=""; fi
+      fi
+      line=$(printf "$fmt" "$ns" "${color}${icon}${NC}" "$phase" "$name" "${by_c}${by_pad}${by_c:+${NC}}" "${age:+${age} ago}" "$dur" "$prog" "$note")
+    else
+      line=$(printf "$fmt" "$ns" "${color}${icon}${NC}" "$phase" "$name" "${age:+${age} ago}" "$dur" "$prog" "$note")
+    fi
     # STATE in color: the padded text is wrapped only now (the pattern is
     # unique thanks to the icon's escape codes)
     line="${line/${color}${icon}${NC} ${phase}/${color}${icon} ${phase}${NC}}"
@@ -2001,8 +2116,10 @@ Usage: ${0##*/} [options]
 Settings are remembered in the config file; every option also exists as an
 environment variable (ARGO_WF_SERVER, ARGO_WF_NAMESPACES, ARGOCD_SERVER, …).
 Tunables: ARGO_WF_REFRESH (s, 0 = off), ARGO_WF_LIMIT, ARGO_WF_PROD_BATCHES,
-ARGO_WF_INSECURE=1, ARGO_WF_PLAN_NODES, ARGO_WF_PLAN_LINES, ARGOCD_SELECTOR,
-ARGOCD_SKIP_NAMESPACES, ARGOCD_DIFF_LINES, ARGOCD_DIFF_IGNORE.
+ARGO_WF_INSECURE=1, ARGO_WF_PLAN_NODES, ARGO_WF_PLAN_LINES, ARGO_WF_AUTHOR_PARAMS
+(parameters naming the person behind a run), ARGO_WF_ME (your other names, e.g.
+a GitHub login), ARGOCD_SELECTOR, ARGOCD_SKIP_NAMESPACES, ARGOCD_DIFF_LINES,
+ARGOCD_DIFF_IGNORE.
 EOF
 }
 

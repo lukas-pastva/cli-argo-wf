@@ -108,6 +108,8 @@ PUT /api/v1/workflows/<namespace>/<name>/resume
 
 so the server records you as the one who resumed it, and your usual RBAC applies. Before anything is sent the tool re-checks that the workflow still waits, and asks for confirmation. When the workflow made a Terraform plan, the menu also offers **Show the plan** and **Open the plan in the browser**, and the confirmation repeats its totals.
 
+**Whose workflow is it.** The table has a **BY** column, and the approval screens say it again: the person behind the workflow — the one whose merge or submit started it — and the last person who resumed, stopped or retried it (`last resume by jane@example.com`). Your own name is green; someone else's on a workflow waiting for approval is yellow, and the confirmation then reads *⚠ NOT YOURS — by …* with *Yes, approve … for …*, so a colleague's run does not get approved by a slip of the finger. The person is taken from the `workflows.argoproj.io/creator-email` / `creator-preferred-username` / `creator` labels the server sets on a submit; when the creator is a service account — the workflow came from an Argo Events sensor, a CronWorkflow or the like — the first non-empty workflow parameter named in `ARGO_WF_AUTHOR_PARAMS` is used instead (default `PRMergedBy ghaActor author actor`; set it to whatever your templates call it). "You" means the e-mail you signed in with, anything listed in `ARGO_WF_ME` (your GitHub login, say) and a login that equals your e-mail's local part without dots and dashes. The column disappears when nobody is named on any row.
+
 **Batches.** If the suspended node was expanded from a loop over items that have a `batch` key — its node name then looks like `deploy(2:batch:prod,…)` — the batch name is shown (`waiting for approval: prod`) and used below. Batches listed in `ARGO_WF_PROD_BATCHES` (default `prod`) need a second confirmation: you have to type the batch name. A batch that is a path — `aws/prod/account-1` — counts as well when one of its `/`-separated segments is listed; you then type that segment (`prod`).
 
 ## What is out of sync (Argo CD)
@@ -161,6 +163,8 @@ Everything lives in `~/.config/argo-wf/config` (mode `600`, plain `KEY="value"` 
 | `ARGO_WF_INSECURE` | – | `1` = skip TLS verification (`curl -k`) |
 | `ARGO_WF_PLAN_NODES` | `*plan*` | steps (shell patterns) whose log holds a Terraform plan; `-` = off |
 | `ARGO_WF_PLAN_LINES` | `10` | changed lines listed per resource |
+| `ARGO_WF_AUTHOR_PARAMS` | `PRMergedBy ghaActor author actor` | workflow parameters naming the person behind a run (first non-empty wins) when the creator is a service account |
+| `ARGO_WF_ME` | – | your other names (a GitHub login, say), space separated — shown green, no "not yours" warning |
 | `ARGOCD_SERVER` | – | Argo CD host name; empty = feature off |
 | `ARGOCD_SELECTOR` | `app={namespace},batch={batch}` | label selector for a workflow's applications |
 | `ARGOCD_SKIP_NAMESPACES` | – | namespaces (shell patterns) without Argo CD applications |
