@@ -21,7 +21,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 
 # ─── Colors & helpers ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -806,17 +806,31 @@ _argocd_apps_json() {
   ARGOCD_JSON="$out"
 }
 
+# argocd_login [auto] — runs `argocd login --sso` (the CLI opens the browser
+# and takes the token from the SSO callback itself, nothing to paste). "auto"
+# = started by the dashboard because the CLI is not signed in. rc 0 = signed in.
 argocd_login() {
   section "Argo CD sign-in (${ARGOCD_SERVER})"
+  [[ "${1:-}" == "auto" ]] && sline "${YELLOW}⚠${NC}" "The argocd CLI is not signed in (or its session expired) — signing in now."
   sline "${CYAN}▸${NC}" "Running: argocd login ${ARGOCD_SERVER} --sso ${ARGOCD_FLAGS} (SSO in your browser)"
   sblank
   section_close
   # shellcheck disable=SC2086
   if argocd login "$ARGOCD_SERVER" --sso $ARGOCD_FLAGS </dev/tty; then
-    ok "Signed in"; sleep 1
+    ok "Signed in"; sleep 1; return 0
   else
-    err "Sign-in failed"; sleep 2
+    err "Sign-in failed"; sleep 2; return 1
   fi
+}
+
+# _argocd_signed_in — 0 = the CLI's token for ARGOCD_SERVER is still accepted
+# (GET /api/v1/session/userinfo answers loggedIn: true), 1 = a sign-in is due.
+_argocd_signed_in() {
+  local tok out
+  tok=$(_argocd_token); [[ -n "$tok" ]] || return 1
+  out=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" \
+    | curl -s -m 10 ${CURL_OPTS[@]+"${CURL_OPTS[@]}"} -K - "https://${ARGOCD_SERVER}/api/v1/session/userinfo" 2>/dev/null)
+  [[ "$(jq -r '.loggedIn // false' <<< "$out" 2>/dev/null)" == "true" ]]
 }
 
 # The CLI's token for ARGOCD_SERVER from ~/.config/argocd/config (no yq).
@@ -1871,7 +1885,7 @@ argo_wf_status() {
   # panel stays on screen meanwhile) and then tells the running fzf (--listen)
   # become(...) → fzf exits with "__REFRESH__ <cursor index>", the loop just
   # loads the finished table and puts the cursor back on the same row.
-  local cursor=0 url reuse=0 sel
+  local cursor=0 url reuse=0 sel cd_tried=0
   local tmp="$TMP_PREFIX" meta list total_running total_waiting rc
   rm -rf "$tmp".* 2>/dev/null
   # quick start: the last table from the cache is shown at once (marked as
@@ -1907,6 +1921,19 @@ argo_wf_status() {
       rm -f "$tmp.401"
       argo_wf_ensure_token force || return 0
       continue
+    fi
+    # Argo CD not signed in (a row says so): `argocd login --sso` runs by
+    # itself — the browser opens, nothing to paste — and the table is built
+    # again. Checked against the server first (the row may come from an old
+    # cached table). One attempt per sign-out: after a failed one the row
+    # stays and Enter on it is the manual way; it resets once the row is gone.
+    if grep -q "__ARGOCD_LOGIN__" "$tmp.cur" 2>/dev/null; then
+      if (( ! cd_tried )) && ! _argocd_signed_in; then
+        cd_tried=1
+        if argocd_login auto; then rm -f "$tmp.next"; continue; fi
+      fi
+    else
+      cd_tried=0
     fi
     meta=$(head -1 "$tmp.cur"); list=$(tail -n +2 "$tmp.cur")
     # shellcheck disable=SC2086
