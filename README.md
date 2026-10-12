@@ -120,7 +120,7 @@ For every waiting workflow the tool looks up the Argo CD applications that belon
 - Namespaces whose workflows do not deploy through Argo CD — Terraform runs, say — go into `ARGOCD_SKIP_NAMESPACES` (shell patterns, e.g. `infra-* tf-network`): their workflows are listed and approved like any other, just without the lookup.
 - Keys in `ARGOCD_DIFF_IGNORE` (default `labels`) are removed from both sides before comparing — a chart version bump that only touches labels is noise. Applications that differ *only* there are treated as synced.
 - Diffs longer than `ARGOCD_DIFF_LINES` (default 5, headings not counted) collapse into `… N changes`; press Enter on the resource to see the full diff in the Argo CD UI.
-- Authentication is the `argocd` CLI's own: if you are not signed in, a row offers `argocd login <server> --sso`.
+- Authentication is the `argocd` CLI's own. When the CLI is not signed in (or its session expired), `argocd login <server> --sso` runs by itself the moment the lookup needs it — the browser opens, the CLI takes the token from the SSO callback, nothing to paste — and the table is rebuilt. If that sign-in fails, a row stays in the table and Enter on it runs the login again.
 
 ## What is about to be applied (Terraform / OpenTofu)
 
