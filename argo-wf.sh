@@ -134,16 +134,30 @@ section() {
   box_line ""
   box_line "  $1"
   box_line ""
+  # The whole frame is on screen at once: the rest of the box is filled with
+  # empty rows and closed right away, then the cursor goes back up to the
+  # first free row — every line printed after this overwrites one of them,
+  # so a screen that is still loading never shows a half-drawn box.
+  local used=$BOX_ROWS
+  _box_fill
+  box_bottom
+  (( BOX_ROWS - used > 0 )) && printf '\033[%dA' $(( BOX_ROWS - used ))
+  BOX_ROWS=$used
 }
 
-# Pads the box with empty framed lines so it always fills the terminal —
-# the same full-screen frame the fzf panels use.
-section_close() {
-  box_line ""
+# Empty framed rows down to the row above the bottom border.
+_box_fill() {
   detect_cols
   while (( BOX_ROWS < TERM_LINES - 2 )); do
     box_line ""
   done
+}
+
+# Closes the box — the frame is already full-screen since section(), so this
+# only overwrites the remaining rows with blanks and redraws the bottom.
+section_close() {
+  box_line ""
+  _box_fill
   box_bottom
   BOX_ROWS=0
 }
@@ -1457,6 +1471,10 @@ argo_wf_approve() {
       *) return 0 ;;
     esac
   done
+  # the frame is up before the checks run, so Enter does not leave the
+  # screen empty while the server answers
+  section "Approval — ${ns}/${name}"
+  sline "${CYAN}▸${NC}" "Checking that ${name} is still waiting …"
   # check once more that the workflow still sits on a suspend node
   _argo_wf_waiting "$ns" "$name"
   if [[ -z "$ARGO_WAIT" ]]; then
