@@ -799,7 +799,9 @@ _argocd_apps_json() {
   if ! out=$(argocd app list --server "$ARGOCD_SERVER" $ARGOCD_FLAGS -l "$1" -o json 2>&1); then
     ARGOCD_ERR=$(head -1 <<< "$out" | sed 's/^[A-Z]*\[[0-9]*\] *//')
     case "$out" in
-      *nauthenticated*|*"token is expired"*|*"invalid session"*|*"failed to get user info"*|*"Logged In: false"*|*"not logged in"*) return 2 ;;
+      # the last two: the CLI could not renew its token at the SSO provider
+      # (Dex: "Refresh token is invalid or has already been claimed …")
+      *nauthenticated*|*"token is expired"*|*"invalid session"*|*"failed to get user info"*|*"Logged In: false"*|*"not logged in"*|*invalid_grant*|*"efresh token is invalid"*) return 2 ;;
     esac
     return 1
   fi
@@ -1425,24 +1427,26 @@ argo_wf_approve() {
   [[ "$batch" == "-" ]] && batch=""
   [[ "$plan" == "-" ]] && plan=""
   local what="${batch:+batch ${batch}}"; what="${what:-${node}}"
-  local items="✔  Approve ${what} (resume ${node})"
+  # whose workflow this is (fresh — the row may be minutes old); a colleague's
+  # name goes into the Approve item itself, this menu is the confirmation
+  _argo_wf_waiting "$ns" "$name"
+  local who="" approve="✔  Approve ${what} (resume ${node})"
+  if [[ -n "$ARGO_WAIT_BY" ]]; then
+    if _is_me "$ARGO_WAIT_BY"; then who="yours (${ARGO_WAIT_BY})"
+    else who="⚠ NOT YOURS — by ${ARGO_WAIT_BY}"; approve="✔  Approve ${what} for ${ARGO_WAIT_BY} (resume ${node})"; fi
+  fi
+  [[ -n "$ARGO_WAIT_ACTOR" ]] && who+="${who:+ · }last ${ARGO_WAIT_ACTOR}"
+  local items="$approve"
   if [[ -n "$plan" ]] && _plan_load "$ns" "$name" "$plan" && (( PLAN_UNITS > 0 )); then
     items+=$'\n'"≡  Show the plan (${PLAN_TOTAL})"
     items+=$'\n'"↗  Open the plan in the browser"
   fi
   items+=$'\n'"↗  Open the workflow in the browser"
-  # whose workflow this is (fresh — the row may be minutes old)
-  _argo_wf_waiting "$ns" "$name"
-  local who=""
-  if [[ -n "$ARGO_WAIT_BY" ]]; then
-    if _is_me "$ARGO_WAIT_BY"; then who="yours (${ARGO_WAIT_BY})"
-    else who="by ${ARGO_WAIT_BY} — not yours"; fi
-  fi
-  [[ -n "$ARGO_WAIT_ACTOR" ]] && who+="${who:+ · }last ${ARGO_WAIT_ACTOR}"
   local head="${ns}/${name} is waiting: ${what}${who:+ · ${who}}"
   while true; do
     UI_TITLE="Argo WF — ${name}"
-    ui_select "$items" "wf" "${head} · Enter = select · Esc = back" || return 0
+    [[ "$who" == "⚠ NOT YOURS"* ]] && UI_TITLE="Argo WF — ${name} — by ${ARGO_WAIT_BY}"
+    ui_select "$items" "wf" "${head} · Enter = approve / select · Esc = back" || return 0
     case "$UI_RESULT" in
       "≡"*) argo_wf_plan "$ns" "$name" "$plan" ;;
       "↗  Open the plan"*)
@@ -1461,32 +1465,15 @@ argo_wf_approve() {
     pause_close; return 0
   fi
   local b="${ARGO_WAIT_BATCH:-$batch}" n="${ARGO_WAIT_NODE:-$node}" plan_note=""
-  what="${b:+batch ${b}}"; what="${what:-${n}}"
   # the plan of what waits now (not of the row that was on screen)
   if [[ -n "$ARGO_WAIT_PLAN" ]] && _plan_load "$ns" "$name" "$ARGO_WAIT_PLAN" && (( PLAN_UNITS > 0 )); then
     plan_note=" · plan: ${PLAN_TOTAL}"
   fi
-  # whose workflow you are about to approve — first in the header (a long
-  # header is cut on the right) and in the title when it is not yours
-  local yes="✔  Yes, approve ${what}"
-  who=""
-  UI_TITLE="Approval — ${name}"
-  if [[ -n "$ARGO_WAIT_BY" ]]; then
-    if _is_me "$ARGO_WAIT_BY"; then
-      who="your workflow (${ARGO_WAIT_BY})"
-    else
-      who="⚠ NOT YOURS — by ${ARGO_WAIT_BY}"
-      yes="✔  Yes, approve ${what} for ${ARGO_WAIT_BY}"
-      UI_TITLE="Approval — ${name} — by ${ARGO_WAIT_BY}"
-    fi
-  else
-    who="nobody is named on this workflow"
-  fi
-  [[ -n "$ARGO_WAIT_ACTOR" ]] && who+=" · last ${ARGO_WAIT_ACTOR}"
-  ui_select "✖  No, go back
-${yes}" "confirm" \
-    "${who} · PUT /api/v1/workflows/${ns}/${name}/resume (${n})${plan_note} · Enter = select · Esc = back" || return 0
-  [[ "$UI_RESULT" == "✔"* ]] || return 0
+  # no separate Yes/No screen: picking Approve in the menu is the decision
+  # (the menu names the owner when it is not yours); production batches
+  # still have the typed name below
+  local owner=""
+  [[ -n "$ARGO_WAIT_BY" ]] && ! _is_me "$ARGO_WAIT_BY" && owner=" · ⚠ NOT YOURS — by ${ARGO_WAIT_BY}"
   # production batches (ARGO_WF_PROD_BATCHES) need the batch name typed out;
   # a batch that is a path counts when one of its segments is listed
   # ("aws/prod/account-1") — then that segment is what has to be typed
@@ -1495,11 +1482,11 @@ ${yes}" "confirm" \
     [[ -n "$b" && -z "$word" && "/${b}/" == *"/${pb}/"* ]] && word="$pb"
   done
   if [[ -n "$word" ]]; then
-    UI_TITLE="PRODUCTION — ${name}"
+    UI_TITLE="PRODUCTION — ${name}${owner:+ — by ${ARGO_WAIT_BY}}"
     if [[ "$word" == "$b" ]]; then
-      ui_input "type “${word}”" "Production batch — type its name (${word}) and press Enter to go ahead · Esc = back" || return 0
+      ui_input "type “${word}”" "Production batch${owner}${plan_note} — type its name (${word}) and press Enter to go ahead · Esc = back" || return 0
     else
-      ui_input "type “${word}”" "Production batch ${b} — type “${word}” and press Enter to go ahead · Esc = back" || return 0
+      ui_input "type “${word}”" "Production batch ${b}${owner}${plan_note} — type “${word}” and press Enter to go ahead · Esc = back" || return 0
     fi
     if [[ "$UI_RESULT" != "$word" ]]; then
       section "Approval — ${ns}/${name}"
@@ -1510,12 +1497,11 @@ ${yes}" "confirm" \
   local body
   body=$(jq -cn --arg n "$name" --arg ns "$ns" --arg sel "displayName=${n},phase=Running" \
     '{name: $n, namespace: $ns, nodeFieldSelector: $sel}')
+  # success: straight back to the table, which is rebuilt and shows the
+  # workflow running; only a failure stays on screen
+  _argo_api_put "/api/v1/workflows/${ns}/${name}/resume" "$body" && return 0
   section "Approval — ${ns}/${name}"
-  if _argo_api_put "/api/v1/workflows/${ns}/${name}/resume" "$body"; then
-    sline "${GREEN}✔${NC}" "Approved — the workflow continues (${what})"
-  else
-    sline "${RED}✖${NC}" "Resume failed (HTTP ${ARGO_HTTP_CODE}): $(jq -r '.message // empty' <<< "$ARGO_BODY" 2>/dev/null || head -c 200 <<< "$ARGO_BODY")"
-  fi
+  sline "${RED}✖${NC}" "Resume failed (HTTP ${ARGO_HTTP_CODE}): $(jq -r '.message // empty' <<< "$ARGO_BODY" 2>/dev/null || head -c 200 <<< "$ARGO_BODY")"
   pause_close
 }
 
