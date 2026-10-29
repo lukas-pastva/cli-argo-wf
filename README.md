@@ -120,7 +120,7 @@ For every waiting workflow the tool looks up the Argo CD applications that belon
 - Namespaces whose workflows do not deploy through Argo CD — Terraform runs, say — go into `ARGOCD_SKIP_NAMESPACES` (shell patterns, e.g. `infra-* tf-network`): their workflows are listed and approved like any other, just without the lookup.
 - Keys in `ARGOCD_DIFF_IGNORE` (default `labels`) are removed from both sides before comparing — a chart version bump that only touches labels is noise. Applications that differ *only* there are treated as synced.
 - Diffs longer than `ARGOCD_DIFF_LINES` (default 5, headings not counted) collapse into `… N changes`; press Enter on the resource to see the full diff in the Argo CD UI.
-- Authentication is the `argocd` CLI's own. When the CLI is not signed in (or its session expired), `argocd login <server> --sso` runs by itself the moment the lookup needs it — the browser opens, the CLI takes the token from the SSO callback, nothing to paste — and the table is rebuilt. If that sign-in fails, a row stays in the table and Enter on it runs the login again.
+- Authentication is the `argocd` CLI's own. When the CLI is not signed in (or its session expired), `argocd login <server> --sso` runs by itself the moment the lookup needs it — the browser opens, the CLI takes the token from the SSO callback, nothing to paste — and the table is rebuilt. If that sign-in fails, a row stays in the table and Enter on it runs the login again. Every `argocd` call gets `ARGOCD_TIMEOUT` seconds (default 20): the CLI renews its token at Dex before each call and has no timeout of its own, so a Dex that does not answer used to freeze the whole table — now the Argo CD row says so, the lookup is skipped for the rest of that table, and the workflows can still be approved.
 
 ## What is about to be applied (Terraform / OpenTofu)
 
@@ -169,6 +169,7 @@ Everything lives in `~/.config/argo-wf/config` (mode `600`, plain `KEY="value"` 
 | `ARGOCD_SELECTOR` | `app={namespace},batch={batch}` | label selector for a workflow's applications |
 | `ARGOCD_SKIP_NAMESPACES` | – | namespaces (shell patterns) without Argo CD applications |
 | `ARGOCD_FLAGS` | `--grpc-web` | extra flags for the `argocd` CLI |
+| `ARGOCD_TIMEOUT` | `20` | seconds one `argocd` CLI call may take before it is given up; `0` = no limit |
 | `ARGOCD_DIFF_LINES` | `5` | longer diffs collapse |
 | `ARGOCD_DIFF_IGNORE` | `labels` | keys dropped from both sides of a diff |
 | `ARGO_TOKEN` | – | the bearer token (written by the sign-in screen) |

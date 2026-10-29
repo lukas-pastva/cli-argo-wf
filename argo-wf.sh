@@ -21,7 +21,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-VERSION="1.6.1"
+VERSION="1.6.2"
 
 # ─── Colors & helpers ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -375,7 +375,7 @@ CONFIG_VARS="ARGO_WF_SERVER ARGO_WF_NAMESPACES ARGO_WF_LIMIT ARGO_WF_REFRESH ARG
              ARGO_WF_PROD_BATCHES ARGO_WF_INSECURE ARGO_WF_PLAN_NODES ARGO_WF_PLAN_LINES
              ARGO_WF_AUTHOR_PARAMS ARGO_WF_ME
              ARGOCD_SERVER ARGOCD_SELECTOR
-             ARGOCD_SKIP_NAMESPACES ARGOCD_FLAGS ARGOCD_DIFF_LINES ARGOCD_DIFF_IGNORE"
+             ARGOCD_SKIP_NAMESPACES ARGOCD_FLAGS ARGOCD_TIMEOUT ARGOCD_DIFF_LINES ARGOCD_DIFF_IGNORE"
 
 NAMESPACES=()
 ARGOCD_SKIP=()
@@ -440,6 +440,8 @@ config_apply() {
   # (not ${VAR:=…}: the first "}" of the placeholders would end the expansion)
   [[ -n "$ARGOCD_SELECTOR" ]] || ARGOCD_SELECTOR='app={namespace},batch={batch}'
   : "${ARGOCD_FLAGS:=--grpc-web}"
+  : "${ARGOCD_TIMEOUT:=20}"         # seconds one argocd CLI call may take, 0 = no limit
+  [[ "$ARGOCD_TIMEOUT" =~ ^[0-9]+$ ]] || ARGOCD_TIMEOUT=20
   : "${ARGOCD_DIFF_LINES:=5}"       # longer diffs collapse into "… N changes"
   : "${ARGOCD_DIFF_IGNORE:=labels}" # keys dropped from both sides of the diff
   if [[ -n "$ARGO_WF_SERVER" ]]; then
@@ -801,16 +803,50 @@ _argocd_selector() {
   printf '%s' "$out"
 }
 
+# _argocd_cli <args…> — the argocd CLI under a time limit (ARGOCD_TIMEOUT
+# seconds, 0 = none). The CLI renews its token at Dex before a call and has
+# no timeout of its own, so a Dex that takes the connection and never answers
+# would hang the table for good. rc 124 = limit hit, the CLI was killed; GNU
+# timeout when there is one, otherwise a watchdog in the background.
+_argocd_cli() {
+  local t="${ARGOCD_TIMEOUT:-20}" tb rc pid wd
+  if (( t <= 0 )); then argocd "$@"; return; fi
+  if tb=$(command -v timeout || command -v gtimeout); then
+    "$tb" "$t" argocd "$@"; rc=$?
+  else
+    # output through a file: a pipe would stay open as long as anything the
+    # CLI started is still alive, and the caller's $(…) would wait for it
+    local tmp="${TMP_PREFIX:-${TMPDIR:-/tmp}/argo-wf.$$}.cli.${RANDOM}"
+    argocd "$@" >"$tmp" 2>&1 & pid=$!
+    ( sleep "$t"; kill -TERM "$pid" 2>/dev/null ) >/dev/null 2>&1 & wd=$!
+    wait "$pid"; rc=$?
+    kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+    cat "$tmp" 2>/dev/null; rm -f "$tmp"
+    (( rc == 143 )) && rc=124
+  fi
+  return $rc
+}
+
 # _argocd_apps_json <label-selector> — JSON list of applications in
 # ARGOCD_JSON (not stdout, a subshell would lose ARGOCD_ERR); rc 1 = the CLI
-# failed (ARGOCD_ERR = text), rc 2 = not signed in.
+# failed (ARGOCD_ERR = text), rc 2 = not signed in. Once a call has hit the
+# time limit the CLI is left alone for the rest of this table (ARGOCD_DOWN,
+# reset by _argo_wf_build) — every waiting workflow would otherwise wait the
+# full limit for the same answer.
 ARGOCD_ERR=""
 ARGOCD_JSON=""
+ARGOCD_DOWN=""
 _argocd_apps_json() {
-  local out
+  local out rc
   ARGOCD_ERR=""; ARGOCD_JSON=""
+  if [[ -n "$ARGOCD_DOWN" ]]; then ARGOCD_ERR="$ARGOCD_DOWN"; return 1; fi
   # shellcheck disable=SC2086
-  if ! out=$(argocd app list --server "$ARGOCD_SERVER" $ARGOCD_FLAGS -l "$1" -o json 2>&1); then
+  out=$(_argocd_cli app list --server "$ARGOCD_SERVER" $ARGOCD_FLAGS -l "$1" -o json 2>&1); rc=$?
+  if (( rc == 124 )); then
+    ARGOCD_DOWN="argocd CLI: no answer in ${ARGOCD_TIMEOUT} s (token renewal at Dex hangs? try: argocd account get-user-info) — lookup skipped"
+    ARGOCD_ERR="$ARGOCD_DOWN"; return 1
+  fi
+  if (( rc != 0 )); then
     ARGOCD_ERR=$(head -1 <<< "$out" | sed 's/^[A-Z]*\[[0-9]*\] *//')
     case "$out" in
       # the last two: the CLI could not renew its token at the SSO provider
@@ -1565,6 +1601,7 @@ _argo_flush_diff() {
 ARGO_WF_CACHE_VER=7
 _argo_wf_build() {
   local outfile="$1"
+  ARGOCD_DOWN=""                    # one time limit per table, see _argocd_apps_json
   local ns rows phase name age dur prog url total_running=0 total_waiting=0
   local recs="" kind note w_ns w_name list line S=$'\x1f'
   _argo_prog "${CYAN}▸${NC}" "Argo: ${NAMESPACES[*]} …"
@@ -2149,8 +2186,8 @@ environment variable (ARGO_WF_SERVER, ARGO_WF_NAMESPACES, ARGOCD_SERVER, …).
 Tunables: ARGO_WF_REFRESH (s, 0 = off), ARGO_WF_LIMIT, ARGO_WF_PROD_BATCHES,
 ARGO_WF_INSECURE=1, ARGO_WF_PLAN_NODES, ARGO_WF_PLAN_LINES, ARGO_WF_AUTHOR_PARAMS
 (parameters naming the person behind a run), ARGO_WF_ME (your other names, e.g.
-a GitHub login), ARGOCD_SELECTOR, ARGOCD_SKIP_NAMESPACES, ARGOCD_DIFF_LINES,
-ARGOCD_DIFF_IGNORE.
+a GitHub login), ARGOCD_SELECTOR, ARGOCD_SKIP_NAMESPACES, ARGOCD_TIMEOUT (seconds
+one argocd call may take), ARGOCD_DIFF_LINES, ARGOCD_DIFF_IGNORE.
 EOF
 }
 
