@@ -21,7 +21,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-VERSION="1.6.1"
+VERSION="1.6.2"
 
 # ─── Colors & helpers ────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -375,7 +375,8 @@ CONFIG_VARS="ARGO_WF_SERVER ARGO_WF_NAMESPACES ARGO_WF_LIMIT ARGO_WF_REFRESH ARG
              ARGO_WF_PROD_BATCHES ARGO_WF_INSECURE ARGO_WF_PLAN_NODES ARGO_WF_PLAN_LINES
              ARGO_WF_AUTHOR_PARAMS ARGO_WF_ME
              ARGOCD_SERVER ARGOCD_SELECTOR
-             ARGOCD_SKIP_NAMESPACES ARGOCD_FLAGS ARGOCD_DIFF_LINES ARGOCD_DIFF_IGNORE"
+             ARGOCD_SKIP_NAMESPACES ARGOCD_FLAGS ARGOCD_TIMEOUT ARGOCD_LOGIN_TIMEOUT
+             ARGOCD_DIFF_LINES ARGOCD_DIFF_IGNORE"
 
 NAMESPACES=()
 ARGOCD_SKIP=()
@@ -440,6 +441,10 @@ config_apply() {
   # (not ${VAR:=…}: the first "}" of the placeholders would end the expansion)
   [[ -n "$ARGOCD_SELECTOR" ]] || ARGOCD_SELECTOR='app={namespace},batch={batch}'
   : "${ARGOCD_FLAGS:=--grpc-web}"
+  : "${ARGOCD_TIMEOUT:=10}"         # seconds one argocd CLI call may take, 0 = no limit
+  [[ "$ARGOCD_TIMEOUT" =~ ^[0-9]+$ ]] || ARGOCD_TIMEOUT=10
+  : "${ARGOCD_LOGIN_TIMEOUT:=120}"  # seconds `argocd login --sso` may take (browser included)
+  [[ "$ARGOCD_LOGIN_TIMEOUT" =~ ^[0-9]+$ ]] || ARGOCD_LOGIN_TIMEOUT=120
   : "${ARGOCD_DIFF_LINES:=5}"       # longer diffs collapse into "… N changes"
   : "${ARGOCD_DIFF_IGNORE:=labels}" # keys dropped from both sides of the diff
   if [[ -n "$ARGO_WF_SERVER" ]]; then
@@ -801,16 +806,58 @@ _argocd_selector() {
   printf '%s' "$out"
 }
 
+# _argocd_cli <args…> — the argocd CLI under a time limit (ARGOCD_TIMEOUT
+# seconds, 0 = none). The CLI renews its token at Dex before a call and has
+# no timeout of its own, so a Dex that takes the connection and never answers
+# would hang the table for good. rc 124 = limit hit, the CLI was killed; GNU
+# timeout when there is one, otherwise a watchdog in the background.
+# ARGOCD_CLI_FG=1 = an interactive call (the sign-in): it keeps the terminal
+# and its output is not captured.
+_argocd_cli() {
+  local t="${ARGOCD_TIMEOUT:-10}" fg="${ARGOCD_CLI_FG:-0}" tb rc pid wd tmp=""
+  if (( t <= 0 )); then argocd "$@"; return; fi
+  if tb=$(command -v timeout || command -v gtimeout); then
+    if (( fg )); then "$tb" --foreground "$t" argocd "$@"; else "$tb" "$t" argocd "$@"; fi; rc=$?
+  else
+    if (( fg )); then
+      argocd "$@" & pid=$!
+    else
+      # output through a file: a pipe would stay open as long as anything the
+      # CLI started is still alive, and the caller's $(…) would wait for it
+      tmp="${TMP_PREFIX:-${TMPDIR:-/tmp}/argo-wf.$$}.cli.${RANDOM}"
+      argocd "$@" >"$tmp" 2>&1 & pid=$!
+    fi
+    ( sleep "$t"; kill -TERM "$pid" 2>/dev/null ) >/dev/null 2>&1 & wd=$!
+    wait "$pid" 2>/dev/null; rc=$?       # 2>: no "Terminated" job notice
+    kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+    [[ -n "$tmp" ]] && { cat "$tmp" 2>/dev/null; rm -f "$tmp"; }
+    (( rc == 143 )) && rc=124
+  fi
+  return $rc
+}
+
 # _argocd_apps_json <label-selector> — JSON list of applications in
 # ARGOCD_JSON (not stdout, a subshell would lose ARGOCD_ERR); rc 1 = the CLI
-# failed (ARGOCD_ERR = text), rc 2 = not signed in.
+# failed (ARGOCD_ERR = text), rc 2 = not signed in, rc 3 = the CLI gave no
+# answer within the time limit (the row then takes Enter, see argocd_down). Once a call has hit the
+# time limit the CLI is left alone for ARGOCD_RETRY_AFTER seconds (a marker
+# file per server, so the background refresh and a restarted tool see it too)
+# — every waiting workflow and every refresh would otherwise wait the full
+# limit for the same answer.
 ARGOCD_ERR=""
 ARGOCD_JSON=""
+ARGOCD_RETRY_AFTER=300
 _argocd_apps_json() {
-  local out
+  local out rc mark="${TMPDIR:-/tmp}/argo-wf.cddown.${ARGOCD_SERVER//[^A-Za-z0-9._-]/_}"
+  local silent="argocd CLI gave no answer in ${ARGOCD_TIMEOUT} s — lookup skipped · Enter = check & retry"
   ARGOCD_ERR=""; ARGOCD_JSON=""
+  if [[ -f "$mark" ]] && (( $(date +%s) - $(_mtime "$mark") < ARGOCD_RETRY_AFTER )); then
+    ARGOCD_ERR="$silent"; return 3
+  fi
   # shellcheck disable=SC2086
-  if ! out=$(argocd app list --server "$ARGOCD_SERVER" $ARGOCD_FLAGS -l "$1" -o json 2>&1); then
+  out=$(_argocd_cli app list --server "$ARGOCD_SERVER" $ARGOCD_FLAGS -l "$1" -o json 2>&1); rc=$?
+  if (( rc == 124 )); then touch "$mark"; ARGOCD_ERR="$silent"; return 3; fi
+  if (( rc != 0 )); then
     ARGOCD_ERR=$(head -1 <<< "$out" | sed 's/^[A-Z]*\[[0-9]*\] *//')
     case "$out" in
       # the last two: the CLI could not renew its token at the SSO provider
@@ -819,24 +866,76 @@ _argocd_apps_json() {
     esac
     return 1
   fi
-  ARGOCD_JSON="$out"
+  ARGOCD_JSON="$out"; rm -f "$mark"
+}
+
+# _argocd_sso_alive — 0 = the token endpoint of Argo CD's built-in Dex
+# answers (any HTTP status within 5 s), or there is no Dex (another provider);
+# 1 = Dex takes the connection and stays silent — a sign-in would then hang
+# after the browser step (the code→token exchange), and so does every argocd
+# call on its token renewal. Reason in ARGOCD_SSO_ERR.
+ARGOCD_SSO_ERR=""
+_argocd_sso_alive() {
+  local base="https://${ARGOCD_SERVER}/api/dex" out code ep
+  ARGOCD_SSO_ERR=""
+  out=$(curl -s -m 5 ${CURL_OPTS[@]+"${CURL_OPTS[@]}"} -w $'\n%{http_code}' "${base}/.well-known/openid-configuration" 2>/dev/null)
+  code="${out##*$'\n'}"
+  if [[ "$code" == "000" ]]; then ARGOCD_SSO_ERR="Dex (${base}) does not answer"; return 1; fi
+  [[ "$code" == "200" ]] || return 0
+  ep=$(jq -r '.token_endpoint // empty' <<< "${out%$'\n'*}" 2>/dev/null); [[ -n "$ep" ]] || return 0
+  code=$(curl -s -m 5 ${CURL_OPTS[@]+"${CURL_OPTS[@]}"} -o /dev/null -w '%{http_code}' -X POST \
+    -d 'grant_type=refresh_token&refresh_token=probe&client_id=argo-cd-cli' "$ep" 2>/dev/null)
+  [[ "$code" != "000" ]] && return 0
+  ARGOCD_SSO_ERR="the SSO token endpoint (${ep}) takes the connection and does not answer — a sign-in would hang after the browser step"
+  return 1
 }
 
 # argocd_login [auto] — runs `argocd login --sso` (the CLI opens the browser
 # and takes the token from the SSO callback itself, nothing to paste). "auto"
 # = started by the dashboard because the CLI is not signed in. rc 0 = signed in.
+# Not started while the SSO token endpoint is silent (_argocd_sso_alive), and
+# ARGOCD_LOGIN_TIMEOUT caps it in any case.
 argocd_login() {
   section "Argo CD sign-in (${ARGOCD_SERVER})"
   [[ "${1:-}" == "auto" ]] && sline "${YELLOW}⚠${NC}" "The argocd CLI is not signed in (or its session expired) — signing in now."
-  sline "${CYAN}▸${NC}" "Running: argocd login ${ARGOCD_SERVER} --sso ${ARGOCD_FLAGS} (SSO in your browser)"
+  if ! _argocd_sso_alive; then
+    sline "${RED}✖${NC}" "Not started: ${ARGOCD_SSO_ERR}."
+    sline "" "Approving does not need Argo CD — try the sign-in again later."
+    if [[ "${1:-}" == "auto" ]]; then sblank; section_close; sleep 4; else pause_close; fi
+    return 1
+  fi
+  sline "${CYAN}▸${NC}" "Running: argocd login ${ARGOCD_SERVER} --sso ${ARGOCD_FLAGS} (SSO in your browser, ${ARGOCD_LOGIN_TIMEOUT} s at most)"
   sblank
   section_close
+  local rc
   # shellcheck disable=SC2086
-  if argocd login "$ARGOCD_SERVER" --sso $ARGOCD_FLAGS </dev/tty; then
-    ok "Signed in"; sleep 1; return 0
-  else
-    err "Sign-in failed"; sleep 2; return 1
-  fi
+  ARGOCD_CLI_FG=1 ARGOCD_TIMEOUT="$ARGOCD_LOGIN_TIMEOUT" _argocd_cli login "$ARGOCD_SERVER" --sso $ARGOCD_FLAGS </dev/tty; rc=$?
+  if (( rc == 0 )); then ok "Signed in"; sleep 1; return 0; fi
+  if (( rc == 124 )); then err "Sign-in given up after ${ARGOCD_LOGIN_TIMEOUT} s (the SSO token endpoint did not answer?)"; sleep 3; return 1; fi
+  err "Sign-in failed"; sleep 2; return 1
+}
+
+# argocd_down — Enter on the "argocd CLI gave no answer" row. Asks Dex's
+# token endpoint once more: answering again = the marker goes and the table
+# is built anew, so the lookup runs at once; still silent = says so in plain
+# words (server side, approving does not need it) and offers to retry anyway
+# or to open Argo CD in the browser.
+argocd_down() {
+  local mark="${TMPDIR:-/tmp}/argo-wf.cddown.${ARGOCD_SERVER//[^A-Za-z0-9._-]/_}"
+  section "Argo CD — ${ARGOCD_SERVER}"
+  sline "${CYAN}▸${NC}" "Checking whether Argo CD's sign-in service (Dex) answers again …"
+  if _argocd_sso_alive; then rm -f "$mark"; return 0; fi
+  UI_TITLE="Argo CD — ${ARGOCD_SERVER}"
+  _fzf_at_least 0 54 && UI_EXTRA_OPTS+=(--wrap)
+  ui_select "↻  Try the lookup again anyway
+↗  Open Argo CD in the browser
+←  Back to the table" "argocd" \
+    "Still down: ${ARGOCD_SSO_ERR}. That is on the server's side — nothing to fix on this machine, and approving does not need Argo CD. Retried by itself every $((ARGOCD_RETRY_AFTER / 60)) min · Enter = select · Esc = back" || return 0
+  case "$UI_RESULT" in
+    "↻"*) rm -f "$mark" ;;
+    "↗"*) _open_url "https://${ARGOCD_SERVER}/applications" ;;
+  esac
+  return 0
 }
 
 # _argocd_signed_in — 0 = the CLI's token for ARGOCD_SERVER is still accepted
@@ -1007,6 +1106,7 @@ _argocd_oos_rows() {
   ARGOCD_ROWS=""
   _argocd_apps_json "$sel"; rc=$?; json="$ARGOCD_JSON"
   if (( rc == 2 )); then ARGOCD_ROWS="cdlogin"; return 0; fi
+  if (( rc == 3 )); then ARGOCD_ROWS="cddown${S}${ARGOCD_ERR}"; return 0; fi
   if (( rc != 0 )); then ARGOCD_ROWS="cderr${S}${ARGOCD_ERR}"; return 0; fi
   ARGOCD_ROWS=$(jq -r --arg S "$S" --arg base "https://${ARGOCD_SERVER}/applications" '
     (. // []) as $apps
@@ -1562,7 +1662,7 @@ _argo_flush_diff() {
 # line "META <version> <running> <waiting> <config key>", then the list.
 # rc 3 = 401 (a new token is needed). Bump ARGO_WF_CACHE_VER whenever the row
 # or URL format changes — an older cache is then ignored at start-up.
-ARGO_WF_CACHE_VER=7
+ARGO_WF_CACHE_VER=8
 _argo_wf_build() {
   local outfile="$1"
   local ns rows phase name age dur prog url total_running=0 total_waiting=0
@@ -1670,10 +1770,11 @@ _argo_wf_build() {
               _argo_flush_diff ;;
             cdlogin) recs+="cdlogin${S}${S}Argo CD${S}-${S}${S}${S}${S}not signed in · Enter = argocd login --sso${S}${S}__ARGOCD_LOGIN__"$'\n' ;;
             cderr)   recs+="cderr${S}${S}Argo CD${S}-${S}${S}${S}${S}${cda}${S}${S}"$'\n' ;;
+            cddown)  recs+="cderr${S}${S}Argo CD${S}-${S}${S}${S}${S}${cda}${S}${S}__ARGOCD_DOWN__"$'\n' ;;
           esac
         done <<< "$ARGOCD_ROWS"
         # nothing with real changes (all synced, or labels only) → one row
-        if (( cd_real == 0 )) && [[ "$ARGOCD_ROWS" != cdlogin* && "$ARGOCD_ROWS" != cderr* ]]; then
+        if (( cd_real == 0 )) && [[ "$ARGOCD_ROWS" != cdlogin* && "$ARGOCD_ROWS" != cderr* && "$ARGOCD_ROWS" != cddown* ]]; then
           local selq="${sel//=/%3D}"; selq="${selq//,/%2C}"
           recs+="cdok${S}${S}Synced${S}-${S}${S}${S}${S}Argo CD: apps (${sel}) synced${S}${S}https://${ARGOCD_SERVER}/applications?labels=${selq}"$'\n'
         fi
@@ -1997,6 +2098,7 @@ NAV
     cursor="$sel"
     if [[ "$url" == "__RULE__" || "$url" == "__SKIP__" ]]; then reuse=1; continue; fi
     if [[ "$url" == "__ARGOCD_LOGIN__" ]]; then argocd_login; continue; fi
+    if [[ "$url" == "__ARGOCD_DOWN__" ]]; then argocd_down; continue; fi
     if [[ "$url" == "__UPDATE__" ]]; then self_update ui; reuse=1; continue; fi
     if [[ "$url" == __WAIT__* ]]; then
       # shellcheck disable=SC2086
@@ -2149,8 +2251,8 @@ environment variable (ARGO_WF_SERVER, ARGO_WF_NAMESPACES, ARGOCD_SERVER, …).
 Tunables: ARGO_WF_REFRESH (s, 0 = off), ARGO_WF_LIMIT, ARGO_WF_PROD_BATCHES,
 ARGO_WF_INSECURE=1, ARGO_WF_PLAN_NODES, ARGO_WF_PLAN_LINES, ARGO_WF_AUTHOR_PARAMS
 (parameters naming the person behind a run), ARGO_WF_ME (your other names, e.g.
-a GitHub login), ARGOCD_SELECTOR, ARGOCD_SKIP_NAMESPACES, ARGOCD_DIFF_LINES,
-ARGOCD_DIFF_IGNORE.
+a GitHub login), ARGOCD_SELECTOR, ARGOCD_SKIP_NAMESPACES, ARGOCD_TIMEOUT (seconds
+one argocd call may take), ARGOCD_LOGIN_TIMEOUT, ARGOCD_DIFF_LINES, ARGOCD_DIFF_IGNORE.
 EOF
 }
 
